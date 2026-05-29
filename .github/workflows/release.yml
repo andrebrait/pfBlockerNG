@@ -1,0 +1,224 @@
+name: Release
+
+# Triggered when a versioned tag (v*) is pushed to any branch.
+# Tags pushed from 'devel' become pre-releases; tags from 'main' become
+# full releases.  After publishing the GitHub Release, a PR is opened
+# on pfsense/FreeBSD-ports to update the corresponding port's GH_TAGNAME.
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+jobs:
+  # ── 1. Test ──────────────────────────────────────────────────────────────
+  test:
+    name: pytest / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install pytest
+      - run: |
+          cd usr/local/pkg/pfblockerng
+          python -m pytest tests/ -v
+
+  # ── 2. Release ───────────────────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: write
+
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      branch: ${{ steps.meta.outputs.branch }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history for changelog
+
+      - name: Gather release metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Determine which branch this tag was created from
+          BRANCH=$(git branch -r --contains "$TAG" \
+            | grep -v HEAD \
+            | sed 's|origin/||' \
+            | grep -E '^(main|devel)$' \
+            | head -1)
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+          # Tags from 'devel' are pre-releases
+          if [ "$BRANCH" = "devel" ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find previous tag on the same branch
+        id: prev_tag
+        run: |
+          BRANCH="${{ steps.meta.outputs.branch }}"
+          CURRENT="${GITHUB_REF_NAME}"
+
+          # All tags reachable from this branch, sorted by version descending,
+          # excluding the current tag
+          PREV=$(git tag --sort=-version:refname \
+            | grep -v "^${CURRENT}$" \
+            | while read t; do
+                git merge-base --is-ancestor "$t" "origin/${BRANCH}" 2>/dev/null \
+                  && echo "$t" && break
+              done)
+
+          echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          CURRENT="${GITHUB_REF_NAME}"
+          PREV="${{ steps.prev_tag.outputs.tag }}"
+
+          if [ -n "$PREV" ]; then
+            RANGE="${PREV}..${CURRENT}"
+            HEADER="Changes since ${PREV}"
+          else
+            RANGE="${CURRENT}"
+            HEADER="Initial release"
+          fi
+
+          BODY=$(git log "$RANGE" \
+            --pretty=format:"- %s" \
+            --no-merges \
+            -- \
+            usr/ etc/ scripts/ \
+            | head -50)
+
+          {
+            echo "body<<EOF"
+            echo "## ${HEADER}"
+            echo ""
+            echo "${BODY}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build source archive
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          ARCHIVE="pfBlockerNG-${VERSION}.tar.gz"
+
+          # Include all package files, exclude test/CI infra
+          tar -czf "$ARCHIVE" \
+            --exclude=".git" \
+            --exclude=".github" \
+            --exclude="scripts" \
+            --exclude="usr/local/pkg/pfblockerng/tests" \
+            --exclude="*.pyc" \
+            --exclude="__pycache__" \
+            usr/ etc/
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: pfBlockerNG ${{ steps.meta.outputs.version }}
+          body: ${{ steps.changelog.outputs.body }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          files: ${{ env.ARCHIVE }}
+
+  # ── 3. Open PR on pfsense/FreeBSD-ports ──────────────────────────────────
+  ports-pr:
+    name: Open FreeBSD ports PR
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout FreeBSD-ports fork
+        uses: actions/checkout@v4
+        with:
+          repository: andrebrait/FreeBSD-ports
+          token: ${{ secrets.PORTS_TOKEN }}
+          fetch-depth: 1
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine port path and branch
+        id: port
+        run: |
+          BRANCH="${{ needs.release.outputs.branch }}"
+          VERSION="${{ needs.release.outputs.version }}"
+          TAG="v${VERSION}"
+
+          if [ "$BRANCH" = "devel" ]; then
+            PORT_PATH="net/pfSense-pkg-pfBlockerNG-devel"
+          else
+            PORT_PATH="net/pfSense-pkg-pfBlockerNG"
+          fi
+
+          PR_BRANCH="pfblockerng/bump-${TAG}-$(date +%Y%m%d%H%M%S)"
+
+          echo "port_path=${PORT_PATH}" >> "$GITHUB_OUTPUT"
+          echo "pr_branch=${PR_BRANCH}"  >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"              >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"      >> "$GITHUB_OUTPUT"
+
+      - name: Update GH_TAGNAME and PORTVERSION in Makefile
+        run: |
+          MAKEFILE="${{ steps.port.outputs.port_path }}/Makefile"
+          VERSION="${{ steps.port.outputs.version }}"
+          TAG="${{ steps.port.outputs.tag }}"
+
+          # Update PORTVERSION and GH_TAGNAME; reset PORTREVISION to 0
+          sed -i \
+            -e "s/^PORTVERSION=.*/PORTVERSION=\t${VERSION}/" \
+            -e "s/^GH_TAGNAME=.*/GH_TAGNAME=\tv${VERSION}/" \
+            -e "/^PORTREVISION=/d" \
+            "$MAKEFILE"
+
+          git checkout -b "${{ steps.port.outputs.pr_branch }}"
+          git add "$MAKEFILE"
+          git commit -m "$(printf '%s: update to %s\n\nPoints GH_TAGNAME to %s in andrebrait/pfBlockerNG.' \
+            "${{ steps.port.outputs.port_path }}" "$VERSION" "$TAG")"
+          git push origin "${{ steps.port.outputs.pr_branch }}"
+
+      - name: Create pull request on pfsense/FreeBSD-ports
+        env:
+          GH_TOKEN: ${{ secrets.PORTS_TOKEN }}
+        run: |
+          PRERELEASE="${{ needs.release.outputs.prerelease }}"
+          VERSION="${{ steps.port.outputs.version }}"
+          PORT="${{ steps.port.outputs.port_path }}"
+          TAG="${{ steps.port.outputs.tag }}"
+
+          if [ "$PRERELEASE" = "true" ]; then
+            CHANNEL_NOTE=" (devel / pre-release)"
+          else
+            CHANNEL_NOTE=""
+          fi
+
+          gh pr create \
+            --repo pfsense/FreeBSD-ports \
+            --base devel \
+            --head "andrebrait:${{ steps.port.outputs.pr_branch }}" \
+            --title "${PORT}: update to ${VERSION}${CHANNEL_NOTE}" \
+            --body "$(printf \
+              'Bump \`GH_TAGNAME\` to \`%s\` in \`%s\`.\n\nSource: https://github.com/andrebrait/pfBlockerNG/releases/tag/%s' \
+              "$TAG" "$PORT" "$TAG")"

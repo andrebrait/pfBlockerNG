@@ -1,0 +1,49 @@
+name: Python tests
+
+# Run on every push to any branch.
+# For pull requests from forks, require explicit approval before running
+# (enforced via the 'pr-approval' environment defined in repo settings).
+on:
+  push:
+    branches:
+      - '**'
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  test:
+    name: pytest / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+
+    # pull_request_target runs in the context of the base repo, so secrets
+    # are available.  Gate external-fork PRs behind a required-reviewer
+    # environment so they don't run automatically.
+    environment: ${{ github.event_name == 'pull_request_target' && 'pr-approval' || '' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the minimum (pfSense CE 2.8 / FreeBSD 15 baseline).
+        # Also test against the current stable and latest releases.
+        python-version: ['3.11', '3.12', '3.13']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # For pull_request_target, check out the head of the PR branch
+          # (not the base) so we test the proposed changes.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Run tests
+        run: |
+          cd usr/local/pkg/pfblockerng
+          python -m pytest tests/ -v
