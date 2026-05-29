@@ -37,7 +37,7 @@
   // The 26 ip_pre_AWS_*.sh scripts are auto-generated boilerplate.
   // Exclude them from search results and the file watcher to reduce noise.
   "search.exclude": {
-    "usr/local/pkg/pfblockerng/ip_pre_AWS_*.sh": true
+    "src/usr/local/pkg/pfblockerng/ip_pre_AWS_*.sh": true
   },
   "files.watcherExclude": {
     "**/ip_pre_AWS_*.sh": true

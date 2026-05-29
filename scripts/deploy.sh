@@ -57,14 +57,13 @@ echo "==> Deploying pfBlockerNG ($CHANNEL) to $SSH_TARGET"
 
 # Sync all source files, preserving permissions
 rsync -az --rsync-path="rsync" \
-    --exclude="tests/" \
     --exclude="*.pyc" \
     --exclude="__pycache__/" \
-    "${REPO_ROOT}/usr/" \
+    "${REPO_ROOT}/src/usr/" \
     "${SSH_TARGET}:${PKG_PREFIX}/"
 
 rsync -az --rsync-path="rsync" \
-    "${REPO_ROOT}/etc/" \
+    "${REPO_ROOT}/src/etc/" \
     "${SSH_TARGET}:/etc/"
 
 echo "==> Files synced. Restarting services..."

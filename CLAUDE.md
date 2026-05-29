@@ -10,30 +10,31 @@
 
 ```
 pfBlockerNG/
-├── etc/inc/priv/          # pfSense privilege definitions (.priv.inc)
+├── src/                   # Production code — root mirrors pfSense filesystem
+│   ├── etc/inc/priv/      # pfSense privilege definitions (.priv.inc)
+│   └── usr/local/
+│       ├── pkg/pfblockerng/   # Core package logic
+│       │   ├── pfblockerng.inc        # Main PHP include
+│       │   ├── pfblockerng_install.inc
+│       │   ├── pfblockerng_extra.inc
+│       │   ├── pfb_unbound_include.inc
+│       │   ├── pfb_unbound.py         # Unbound Python plugin
+│       │   ├── pfblockerng.sh         # Shell script (POSIX sh)
+│       │   └── ip_pre_AWS_*.sh        # Auto-generated AWS IP prefix scripts
+│       ├── share/             # Package metadata (info.xml)
+│       └── www/               # Web UI (PHP pages, JS, widgets, wizards)
+├── tests/                 # Python test suite (pytest)
 ├── scripts/               # Developer tooling (deploy, stub generation)
 │   ├── deploy.sh          # Push files to live pfSense over SSH
 │   └── update-pfsense-stubs.py  # Regenerate stubs from pfSense source
 ├── stubs/pfsense/         # PHP stubs for Intelephense (IDE only, not shipped)
-├── usr/local/
-│   ├── pkg/pfblockerng/   # Core package logic
-│   │   ├── pfblockerng.inc        # Main PHP include
-│   │   ├── pfblockerng_install.inc
-│   │   ├── pfblockerng_extra.inc
-│   │   ├── pfb_unbound_include.inc
-│   │   ├── pfb_unbound.py         # Unbound Python plugin
-│   │   ├── pfblockerng.sh         # Shell script (POSIX sh)
-│   │   ├── ip_pre_AWS_*.sh        # Auto-generated AWS IP prefix scripts
-│   │   └── tests/                 # Python test suite (pytest)
-│   ├── share/             # Package metadata (info.xml)
-│   └── www/               # Web UI (PHP pages, JS, widgets, wizards)
 ├── .editorconfig          # Indent rules per language
 ├── .shellcheckrc          # ShellCheck suppressions
 ├── pyproject.toml         # pytest + ruff + mypy config
 └── README.md
 ```
 
-Release archives include only `usr/` and `etc/`. Everything else (stubs, scripts, tests, CI, pyproject.toml, `.githooks/`) is dev-only.
+Release archives contain only `src/`. Everything else (stubs, scripts, tests, CI, pyproject.toml, `.githooks/`) is dev-only.
 
 ---
 
@@ -52,7 +53,7 @@ python -m pytest
 
 Run from repo root. `pyproject.toml` sets `testpaths` and `-v`. No `cd` needed.
 
-Run after **any** change to `usr/local/pkg/pfblockerng/pfb_unbound.py` or `tests/`.
+Run after **any** change to `src/usr/local/pkg/pfblockerng/pfb_unbound.py` or `tests/`.
 
 ---
 

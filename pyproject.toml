@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
 # Run pytest from the repo root; no 'cd' needed in CI or locally.
-testpaths = ["usr/local/pkg/pfblockerng/tests"]
+testpaths = ["tests"]
 addopts   = "-v"
 
 [tool.ruff]

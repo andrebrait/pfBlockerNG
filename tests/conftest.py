@@ -10,4 +10,4 @@ import builtins
 builtins.log_info = lambda msg: None
 
 # Make pfb_unbound importable from its installed location within the repo.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'usr', 'local', 'pkg', 'pfblockerng'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'usr', 'local', 'pkg', 'pfblockerng'))
