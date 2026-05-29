@@ -26,10 +26,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -37,6 +37,20 @@ jobs:
         run: pip install pytest
 
       - name: Run tests
+        # testpaths and addopts are configured in pyproject.toml
+        run: python -m pytest
+
+  # Single stable job name for branch-protection required-status-checks.
+  # Must use if: always() so it runs (and fails) even when 'test' fails.
+  all-tests-passed:
+    name: All tests passed
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix results
         run: |
-          cd usr/local/pkg/pfblockerng
-          python -m pytest tests/ -v
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "One or more test jobs failed or were cancelled."
+            exit 1
+          fi
