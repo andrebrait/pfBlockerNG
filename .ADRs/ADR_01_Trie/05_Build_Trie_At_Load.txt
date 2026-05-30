@@ -93,3 +93,5 @@ HANDOFF
 Report where domainTrie is declared/initialized, which loaders now dual-write,
 and the consistency-check result. Phase 6 will flip operate()/evaluate_* readers
 to the trie.
+
+Now document these results in `.ADRs/ADR_01_Trie/RESULTS/05_Results.md`.

@@ -87,3 +87,5 @@ Push policy as in earlier phases. If you SKIP this phase, instead record in
 HANDOFF
 Report the fused descent signature, the before/after traversal evidence, and
 confirm golden + equivalence tests pass. Phase 8 removes the dead dicts/helpers.
+
+Now document these results in `.ADRs/ADR_01_Trie/RESULTS/07_Results.md`.

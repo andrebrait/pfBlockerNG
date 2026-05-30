@@ -132,3 +132,5 @@ HANDOFF
 Report the DnsblDecision shape, evaluate_domain/evaluate_noaaaa signatures, the
 cfg/containers you threaded through, and where the noAAAA memo write now lives.
 Phase 3 will write golden tests against exactly these signatures.
+
+Now document these results in `.ADRs/ADR_01_Trie/RESULTS/02_Results.md`.

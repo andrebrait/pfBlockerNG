@@ -115,3 +115,5 @@ HANDOFF
 Report the new test classes, the add_* helper names/locations, and confirm the
 golden tests pass against the current (dict-based) implementation. Phase 4 will
 add the trie and reuse these exact tests as the equivalence oracle.
+
+Now document these results in `.ADRs/ADR_01_Trie/RESULTS/03_Results.md`.

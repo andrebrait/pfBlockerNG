@@ -109,3 +109,5 @@ HANDOFF
 Report removed symbols, fixture migration result, grep-clean confirmation,
 pytest/ruff status, and the manual smoke-test outcome recorded in the ADR.
 Migration complete.
+
+Now document these results in `.ADRs/ADR_01_Trie/RESULTS/08_Results.md`.
