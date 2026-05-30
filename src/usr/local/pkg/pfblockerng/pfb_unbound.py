@@ -1437,6 +1437,324 @@ def hsts_check_domain(
     return False, "Python"
 
 
+# ---------------------------------------------------------------------------
+# Domain trie — pure data structure and lookup API
+# NOT wired into operate() or init_standard() yet (Phase 4).
+# The existing dict-based matchers remain the oracle.
+# ---------------------------------------------------------------------------
+
+
+class TrieNode:
+    """Reversed-label trie node (TLD-first insertion)."""
+
+    __slots__ = ("children", "data", "zone", "white", "white_wild", "noaaaa", "noaaaa_wild", "hsts")
+
+    def __init__(self) -> None:
+        self.children: dict[str, TrieNode] | None = None
+        self.data: dict[str, Any] | None = None
+        self.zone: dict[str, Any] | None = None
+        self.white: bool = False
+        self.white_wild: bool = False
+        self.noaaaa: bool | None = None
+        self.noaaaa_wild: bool = False
+        self.hsts: bool = False
+
+
+def trie_split_labels(name: str) -> list[str]:
+    """Return labels in reverse order (TLD-first).
+
+    'ads.example.com' -> ['com', 'example', 'ads']
+    """
+    if not name:
+        return []
+    labels = name.split(".")
+    labels.reverse()
+    return labels
+
+
+def _trie_walk_or_create(root: TrieNode, labels: list[str]) -> TrieNode:
+    """Walk the trie creating nodes as needed; return terminal node."""
+    node = root
+    for label in labels:
+        if not label:
+            continue
+        if node.children is None:
+            node.children = {}
+        child = node.children.get(label)
+        if child is None:
+            child = TrieNode()
+            node.children[label] = child
+        node = child
+    return node
+
+
+def _trie_walk(root: TrieNode, labels: list[str]) -> TrieNode | None:
+    """Walk the trie without creating nodes; return terminal node or None."""
+    node = root
+    for label in labels:
+        if not label:
+            continue
+        if node.children is None:
+            return None
+        child = node.children.get(label)
+        if child is None:
+            return None
+        node = child
+    return node
+
+
+def trie_insert_data(root: TrieNode, domain: str, payload: dict[str, Any]) -> None:
+    """Insert exact-match payload into trie (mirrors dataDB semantics)."""
+    labels = trie_split_labels(domain)
+    if not labels:
+        return
+    node = _trie_walk_or_create(root, labels)
+    node.data = payload
+
+
+def trie_insert_zone(root: TrieNode, domain: str, payload: dict[str, Any]) -> None:
+    """Insert wildcard-incl-self zone payload (mirrors zoneDB semantics)."""
+    labels = trie_split_labels(domain)
+    if not labels:
+        return
+    node = _trie_walk_or_create(root, labels)
+    node.zone = payload
+
+
+def trie_insert_white(root: TrieNode, domain: str, wildcard: bool) -> None:
+    """Insert whitelist entry (exact or wildcard-suffix) into trie."""
+    labels = trie_split_labels(domain)
+    if not labels:
+        return
+    node = _trie_walk_or_create(root, labels)
+    if wildcard:
+        node.white_wild = True
+    else:
+        node.white = True
+
+
+def trie_insert_noaaaa(root: TrieNode, domain: str, wildcard: bool) -> None:
+    """Insert noAAAA entry (exact presence or wildcard-parent) into trie."""
+    labels = trie_split_labels(domain)
+    if not labels:
+        return
+    node = _trie_walk_or_create(root, labels)
+    # noaaaa uses presence check (is not None) for exact; truthy for wildcard-parent.
+    # Store the bool value so both checks work correctly.
+    node.noaaaa = wildcard
+    if wildcard:
+        node.noaaaa_wild = True
+
+
+def trie_insert_hsts(root: TrieNode, domain: str) -> None:
+    """Insert HSTS domain into trie."""
+    labels = trie_split_labels(domain)
+    if not labels:
+        return
+    node = _trie_walk_or_create(root, labels)
+    node.hsts = True
+
+
+def trie_lookup_exact(root: TrieNode, name: str) -> dict[str, Any] | None:
+    """Return terminal node's .data, or None if not found (mirrors dataDB.get)."""
+    labels = trie_split_labels(name)
+    if not labels:
+        return None
+    node = _trie_walk(root, labels)
+    if node is None:
+        return None
+    return node.data
+
+
+def trie_lookup_zone(root: TrieNode, name: str) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+    """Return (matched_domain, payload) for deepest ancestor (incl self) with .zone set.
+
+    Mirrors find_zone_match(): most-specific (longest suffix that is a prefix of name)
+    wins.  The trie walks TLD-first so the last zone hit encountered is the most
+    specific one.
+    """
+    labels = trie_split_labels(name)
+    if not labels:
+        return None, None
+
+    node = root
+    best_key: str | None = None
+    best_payload: dict[str, Any] | None = None
+    # Accumulate labels (in forward/human-readable order) as we descend.
+    # labels[0] is TLD, labels[-1] is leftmost label.
+    # After descending i+1 labels we have matched labels[i..0] reversed = labels[0..i].
+    accumulated: list[str] = []
+
+    for label in labels:
+        if not label:
+            continue
+        if node.children is None:
+            break
+        child = node.children.get(label)
+        if child is None:
+            break
+        node = child
+        accumulated.append(label)
+        if node.zone is not None:
+            # Reconstruct human-readable domain from accumulated labels (reverse of TLD-first).
+            best_key = ".".join(reversed(accumulated))
+            best_payload = node.zone
+
+    if best_key is None:
+        return None, None
+    return best_key, best_payload
+
+
+def trie_lookup_white(root: TrieNode, name: str, tld_seg: int) -> bool:
+    """Reproduce whitelist_check_domain() semantics via trie.
+
+    Three branches:
+    1. Exact match (.white on terminal node for name).
+    2. 'www.'-strip: exact match (.white) on name[4:] after stripping 'www.' prefix.
+    3. Suffix walk: walk progressively shorter suffixes of name; match .white or
+       .white_wild on the suffix node only when suffix label-count x >= tld_seg.
+    """
+    # Branch 1: exact match (presence check — mirrors white_db.get(name) is not None).
+    # Both exact (white) and wildcard (white_wild) entries count as present.
+    labels = trie_split_labels(name)
+    if labels:
+        node = _trie_walk(root, labels)
+        if node is not None and (node.white or node.white_wild):
+            return True
+
+    # Branch 2: www.-strip exact (presence check on stripped name).
+    if name.startswith("www."):
+        stripped = name[4:]
+        slabels = trie_split_labels(stripped)
+        if slabels:
+            snode = _trie_walk(root, slabels)
+            if snode is not None and (snode.white or snode.white_wild):
+                return True
+
+    # Branch 3: suffix walk (mirrors whitelist_check_domain suffix loop).
+    # whitelist_check_domain does:
+    #   q = name.split(".", 1)[-1]          # drop leftmost label
+    #   for x in range(q.count(".")+1, 0, -1):
+    #       if x >= tld_seg and white_db.get(q): return True  # truthy check
+    #       q = q.split(".", 1)[-1]
+    # white_db.get(q) is truthy: True matches, False does not.
+    # In the trie: .white_wild stores True entries (wildcard=True, truthy).
+    # .white stores False entries (wildcard=False, falsy) — suffix walk skips these.
+    if "." not in name:
+        return False
+    suffix = name.split(".", 1)[1]  # drop leftmost label of name
+    # x starts at suffix.count(".")+1 = number of labels in suffix
+    q = suffix
+    x = q.count(".") + 1
+    while x > 0:
+        if x >= tld_seg:
+            qlabels = trie_split_labels(q)
+            if qlabels:
+                qnode = _trie_walk(root, qlabels)
+                if qnode is not None and qnode.white_wild:
+                    return True
+        q = q.split(".", 1)[-1]
+        x -= 1
+
+    return False
+
+
+def trie_lookup_noaaaa(root: TrieNode, name: str) -> bool:
+    """Reproduce evaluate_noaaaa() via trie.
+
+    - Exact: terminal node .noaaaa is not None (presence, any value).
+    - Wildcard-parent: walk parent suffixes (NOT self); match if .noaaaa_wild is truthy.
+      Stop before single-label suffix (TLD only — depth 1).
+    """
+    # Exact branch (mirrors noaaaa_db.get(q_name) is not None)
+    labels = trie_split_labels(name)
+    if labels:
+        node = _trie_walk(root, labels)
+        if node is not None and node.noaaaa is not None:
+            return True
+
+    # Wildcard-parent branch (mirrors find_noaaaa_wildcard_parent).
+    # Start from direct parent (drop leftmost label), stop before single-label suffix.
+    if "." not in name:
+        return False
+    q = name.split(".", 1)[1]  # direct parent
+    # Loop mirrors: for _ in range(q.count("."), 0, -1)
+    # q.count(".") gives number of dots; stops before 0 (single-label TLD).
+    depth = q.count(".")
+    for _ in range(depth, 0, -1):
+        qlabels = trie_split_labels(q)
+        if qlabels:
+            qnode = _trie_walk(root, qlabels)
+            if qnode is not None and qnode.noaaaa_wild:
+                return True
+        q = q.split(".", 1)[1]
+
+    return False
+
+
+def trie_lookup_hsts(
+    root: TrieNode,
+    name: str,
+    hsts_tlds: tuple[str, ...] | list[str],
+    tld: str,
+) -> tuple[bool, str]:
+    """Reproduce hsts_check_domain() via trie including step-2 stride.
+
+    - TLD in hsts_tlds -> (True, 'HSTS_TLD').
+    - Suffix walk with step -2 (skip every other level): check name, then parent
+      of parent, etc.  On hit (.hsts set) -> (True, 'HSTS').
+    - No hit -> (False, 'Python').
+    """
+    if tld in hsts_tlds:
+        return True, "HSTS_TLD"
+
+    # hsts_check_domain iterates: range(q.count(".")+1, 0, -2)
+    # The range step -2 controls how many iterations run (ceil(n/2)), but the
+    # domain advances by exactly 1 label per iteration (q = q.split(".",1)[-1]).
+    # For 'a.b.c.d' (3 dots): range(4,0,-2) -> 2 iters; checks 'a.b.c.d','b.c.d'.
+    # For 'sub.example.com' (2 dots): range(3,0,-2) -> 2 iters; checks 'sub.example.com','example.com'.
+    # We descend the trie TLD-first and collect path nodes indexed from TLD (depth 1).
+    # path_nodes[i] corresponds to the domain at depth i+1.
+    # The n_iters domains to check start at depth dot_count+1 (full name) and
+    # decrease by 1 per step, so path indices are: dot_count, dot_count-1, ..., dot_count-n_iters+1.
+    labels = trie_split_labels(name)
+    if not labels:
+        return False, "Python"
+
+    # Collect path nodes (indexed 0 = TLD depth 1, last = deepest reached).
+    path_nodes: list[TrieNode] = []
+    node = root
+    accumulated: list[str] = []
+    for label in labels:
+        if not label:
+            continue
+        if node.children is None:
+            break
+        child = node.children.get(label)
+        if child is None:
+            break
+        node = child
+        accumulated.append(label)
+        path_nodes.append(node)
+
+    dot_count = name.count(".")
+    full_depth = dot_count + 1
+    # Number of iterations hsts_check_domain runs = ceil(full_depth / 2).
+    n_iters = (full_depth + 1) // 2
+    # Each iter i checks depth (full_depth - i), i.e. path index (full_depth - 1 - i).
+    for i in range(n_iters):
+        path_idx = full_depth - 1 - i
+        if path_idx >= 0 and path_idx < len(path_nodes) and path_nodes[path_idx].hsts:
+            return True, "HSTS"
+
+    return False, "Python"
+
+
+# ---------------------------------------------------------------------------
+# End of trie API
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class DnsblDecision:
     is_found: bool

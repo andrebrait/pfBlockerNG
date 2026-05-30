@@ -20,6 +20,7 @@ MODULE_ERROR = builtins.MODULE_ERROR
 RCODE_NOERROR = builtins.RCODE_NOERROR
 from pfb_unbound import (
     DnsblDecision,
+    TrieNode,
     convert_ipv4,
     convert_ipv6,
     convert_other,
@@ -32,6 +33,16 @@ from pfb_unbound import (
     iter_domain_suffixes,
     python_control_duration,
     resolve_feed_group,
+    trie_insert_data,
+    trie_insert_hsts,
+    trie_insert_noaaaa,
+    trie_insert_white,
+    trie_insert_zone,
+    trie_lookup_exact,
+    trie_lookup_hsts,
+    trie_lookup_noaaaa,
+    trie_lookup_white,
+    trie_lookup_zone,
     whitelist_check_domain,
 )
 
@@ -1252,3 +1263,319 @@ class TestEvaluateNoaaaGolden:
         noaaaa_db2: dict = {"sub.example.com": True}
         # "deep.sub.example.com": parent chain includes "sub.example.com" → True
         assert evaluate_noaaaa("deep.sub.example.com", noaaaa_db2) is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Trie equivalence tests
+# Build both dicts and a trie from the same corpus; assert identical results.
+# ---------------------------------------------------------------------------
+
+
+def _make_trie_root() -> TrieNode:
+    return TrieNode()
+
+
+class TestTrieEquivalence:
+    """Prove trie lookups are equivalent to dict-based matchers.
+
+    All randomness seeded at SEED for reproducibility.
+    Both a dict corpus and a trie are built from the same entries; every
+    query is checked against both and must agree.
+    """
+
+    SEED = 100
+    LABELS = ["a", "bb", "cc", "example", "evil", "sub", "www", "foo", "bar", "xyz"]
+    TLDS = ["com", "net", "org", "io"]
+    N_ENTRIES = 30
+    N_QUERIES = 80
+
+    def _rand_domain(self, rng: random.Random, max_labels: int = 4) -> str:
+        n = rng.randint(1, max_labels)
+        parts = [rng.choice(self.LABELS) for _ in range(n - 1)] + [rng.choice(self.TLDS)]
+        return ".".join(parts)
+
+    # --- exact (dataDB) ---
+
+    def test_exact_equivalence(self) -> None:
+        """trie_lookup_exact == dataDB.get for all queries."""
+        rng = random.Random(self.SEED)
+        data_db: dict = {}
+        root = _make_trie_root()
+        for _ in range(self.N_ENTRIES):
+            d = self._rand_domain(rng)
+            payload = {"log": "1", "index": 0}
+            data_db[d] = payload
+            trie_insert_data(root, d, payload)
+
+        for _ in range(self.N_QUERIES):
+            q = self._rand_domain(rng)
+            assert trie_lookup_exact(root, q) == data_db.get(q), f"exact mismatch for {q!r}"
+
+    def test_exact_subdomain_not_matched(self) -> None:
+        """dataDB is exact-only; subdomain must not match."""
+        root = _make_trie_root()
+        payload = {"log": "1", "index": 0}
+        trie_insert_data(root, "evil.com", payload)
+        assert trie_lookup_exact(root, "sub.evil.com") is None
+        assert trie_lookup_exact(root, "evil.com") == payload
+
+    def test_exact_multi_label_corpus(self) -> None:
+        """Multi-label inserted domains are found; non-inserted are not."""
+        root = _make_trie_root()
+        domains = ["a.b.c.com", "x.y.net", "single.org"]
+        for d in domains:
+            trie_insert_data(root, d, {"log": "1", "index": 0})
+        for d in domains:
+            assert trie_lookup_exact(root, d) is not None
+        assert trie_lookup_exact(root, "notinserted.com") is None
+
+    # --- zone (zoneDB wildcard incl. self) ---
+
+    def test_zone_equivalence(self) -> None:
+        """trie_lookup_zone == find_zone_match for all queries."""
+        rng = random.Random(self.SEED + 1)
+        zone_db: dict = {}
+        root = _make_trie_root()
+        for _ in range(self.N_ENTRIES):
+            d = self._rand_domain(rng)
+            payload = {"log": "1", "index": 0}
+            zone_db[d] = payload
+            trie_insert_zone(root, d, payload)
+
+        for _ in range(self.N_QUERIES):
+            q = self._rand_domain(rng)
+            expected_key, expected_payload = find_zone_match(q, zone_db)
+            got_key, got_payload = trie_lookup_zone(root, q)
+            assert got_key == expected_key, f"zone key mismatch for {q!r}: trie={got_key!r}, dict={expected_key!r}"
+            assert got_payload == expected_payload, f"zone payload mismatch for {q!r}"
+
+    def test_zone_self_match(self) -> None:
+        """Zone entry matches the inserted domain itself (incl. self semantics)."""
+        root = _make_trie_root()
+        payload = {"log": "1", "index": 0}
+        trie_insert_zone(root, "example.com", payload)
+        key, p = trie_lookup_zone(root, "example.com")
+        assert key == "example.com"
+        assert p == payload
+
+    def test_zone_subdomain_match(self) -> None:
+        """Zone entry matches any subdomain; returned key = inserted domain."""
+        root = _make_trie_root()
+        payload = {"log": "1", "index": 42}
+        trie_insert_zone(root, "example.com", payload)
+        key, p = trie_lookup_zone(root, "a.b.example.com")
+        assert key == "example.com"
+        assert p == payload
+
+    def test_zone_b_eval_is_parent_not_query(self) -> None:
+        """b_eval (returned key) must equal the inserted zone key, not query name."""
+        root = _make_trie_root()
+        trie_insert_zone(root, "example.com", {"log": "1", "index": 0})
+        key, _ = trie_lookup_zone(root, "deep.sub.example.com")
+        assert key == "example.com"
+
+    def test_zone_most_specific_wins(self) -> None:
+        """When multiple zones match, deepest (most specific) wins — mirrors dict."""
+        zone_db: dict = {
+            "sub.example.com": {"log": "1", "index": 1},
+            "example.com": {"log": "1", "index": 2},
+        }
+        root = _make_trie_root()
+        for d, p in zone_db.items():
+            trie_insert_zone(root, d, p)
+
+        q = "sub.example.com"
+        expected_key, expected_payload = find_zone_match(q, zone_db)
+        got_key, got_payload = trie_lookup_zone(root, q)
+        assert got_key == expected_key == "sub.example.com"
+        assert got_payload == expected_payload
+
+    def test_zone_no_match(self) -> None:
+        root = _make_trie_root()
+        trie_insert_zone(root, "evil.com", {"log": "1", "index": 0})
+        assert trie_lookup_zone(root, "good.com") == (None, None)
+
+    # --- whitelist (whiteDB) ---
+
+    def test_white_equivalence(self) -> None:
+        """trie_lookup_white == whitelist_check_domain for all queries."""
+        rng = random.Random(self.SEED + 2)
+        white_db: dict = {}
+        root = _make_trie_root()
+        tld_seg = 2
+        for _ in range(self.N_ENTRIES):
+            d = self._rand_domain(rng)
+            wildcard = rng.choice([True, False])
+            white_db[d] = wildcard
+            trie_insert_white(root, d, wildcard)
+
+        for _ in range(self.N_QUERIES):
+            q = self._rand_domain(rng)
+            expected = whitelist_check_domain(q, white_db, tld_seg)
+            got = trie_lookup_white(root, q, tld_seg)
+            assert got == expected, f"white mismatch for {q!r}: trie={got}, dict={expected}"
+
+    def test_white_exact_match(self) -> None:
+        root = _make_trie_root()
+        trie_insert_white(root, "allowed.com", False)
+        assert trie_lookup_white(root, "allowed.com", 2) is True
+
+    def test_white_www_strip(self) -> None:
+        """'www.allowed.com' hits if 'allowed.com' is in whitelist (www-strip branch)."""
+        root = _make_trie_root()
+        trie_insert_white(root, "allowed.com", False)
+        assert trie_lookup_white(root, "www.allowed.com", 2) is True
+
+    def test_white_www_strip_not_for_other_prefix(self) -> None:
+        root = _make_trie_root()
+        trie_insert_white(root, "allowed.com", False)
+        assert trie_lookup_white(root, "sub.allowed.com", 2) is False
+
+    def test_white_tld_seg_boundary_matches(self) -> None:
+        """tld_seg=2: suffix 'evil.com' (x=2) matches; 'com' alone (x=1) does not."""
+        root = _make_trie_root()
+        trie_insert_white(root, "evil.com", True)
+        # x=2 >= tld_seg=2 → match
+        assert trie_lookup_white(root, "sub.evil.com", 2) is True
+
+    def test_white_tld_seg_below_gate_no_match(self) -> None:
+        """tld_seg=2: 'com' alone (x=1 < 2) does not match 'evil.com'."""
+        root = _make_trie_root()
+        trie_insert_white(root, "com", True)
+        # suffix walk for 'evil.com' starts at 'com' (x=1), but 1 < tld_seg=2
+        assert trie_lookup_white(root, "evil.com", 2) is False
+
+    def test_white_high_tld_seg_blocks_intermediate(self) -> None:
+        """tld_seg=3: 'example.com' (x=2) blocked; 'b.example.com' (x=3) passes."""
+        white_db: dict = {"example.com": True}
+        root = _make_trie_root()
+        trie_insert_white(root, "example.com", True)
+        # mirrors TestWhitelistCheckDomain.test_suffix_walk_with_high_tld_seg_blocks_intermediate
+        assert whitelist_check_domain("a.b.example.com", white_db, 3) is False
+        assert trie_lookup_white(root, "a.b.example.com", 3) is False
+
+    def test_white_high_tld_seg_allows_at_gate(self) -> None:
+        white_db: dict = {"b.example.com": True}
+        root = _make_trie_root()
+        trie_insert_white(root, "b.example.com", True)
+        assert whitelist_check_domain("a.b.example.com", white_db, 3) is True
+        assert trie_lookup_white(root, "a.b.example.com", 3) is True
+
+    # --- noAAAA ---
+
+    def test_noaaaa_equivalence(self) -> None:
+        """trie_lookup_noaaaa == evaluate_noaaaa for all queries."""
+        rng = random.Random(self.SEED + 3)
+        noaaaa_db: dict = {}
+        root = _make_trie_root()
+        for _ in range(self.N_ENTRIES):
+            d = self._rand_domain(rng)
+            wildcard = rng.choice([True, False])
+            noaaaa_db[d] = wildcard
+            trie_insert_noaaaa(root, d, wildcard)
+
+        for _ in range(self.N_QUERIES):
+            q = self._rand_domain(rng)
+            expected = evaluate_noaaaa(q, noaaaa_db)
+            got = trie_lookup_noaaaa(root, q)
+            assert got == expected, f"noaaaa mismatch for {q!r}: trie={got}, dict={expected}"
+
+    def test_noaaaa_exact_presence_check(self) -> None:
+        """Exact match succeeds regardless of wildcard flag value (is not None)."""
+        root = _make_trie_root()
+        trie_insert_noaaaa(root, "example.com", False)
+        assert trie_lookup_noaaaa(root, "example.com") is True
+
+    def test_noaaaa_wildcard_parent_matches_child(self) -> None:
+        root = _make_trie_root()
+        trie_insert_noaaaa(root, "example.com", True)
+        assert trie_lookup_noaaaa(root, "sub.example.com") is True
+
+    def test_noaaaa_wildcard_false_does_not_match_child(self) -> None:
+        """wildcard=False (falsy) → parent branch does not match."""
+        root = _make_trie_root()
+        trie_insert_noaaaa(root, "example.com", False)
+        assert trie_lookup_noaaaa(root, "sub.example.com") is False
+
+    def test_noaaaa_self_not_matched_by_wildcard_branch(self) -> None:
+        """Self is handled by exact branch; wildcard branch is parent-only."""
+        root = _make_trie_root()
+        trie_insert_noaaaa(root, "example.com", True)
+        # exact fires for self
+        assert trie_lookup_noaaaa(root, "example.com") is True
+        # wildcard fires for child
+        assert trie_lookup_noaaaa(root, "sub.example.com") is True
+
+    def test_noaaaa_single_label_parent_not_checked(self) -> None:
+        """Walk stops before single-label suffix — TLD-only parent never checked."""
+        root = _make_trie_root()
+        trie_insert_noaaaa(root, "com", True)
+        assert trie_lookup_noaaaa(root, "sub.com") is False
+
+    # --- HSTS ---
+
+    def test_hsts_equivalence(self) -> None:
+        """trie_lookup_hsts == hsts_check_domain for all queries."""
+        rng = random.Random(self.SEED + 4)
+        hsts_db: dict = {}
+        root = _make_trie_root()
+        hsts_tlds: tuple = ()
+        for _ in range(self.N_ENTRIES):
+            d = self._rand_domain(rng)
+            hsts_db[d] = 0
+            trie_insert_hsts(root, d)
+
+        for _ in range(self.N_QUERIES):
+            q = self._rand_domain(rng)
+            tld = q.rsplit(".", 1)[-1]
+            expected = hsts_check_domain(q, hsts_db, hsts_tlds, tld)
+            got = trie_lookup_hsts(root, q, hsts_tlds, tld)
+            assert got == expected, f"hsts mismatch for {q!r}: trie={got}, dict={expected}"
+
+    def test_hsts_tld_preload(self) -> None:
+        """TLD in hsts_tlds → (True, 'HSTS_TLD') regardless of trie content."""
+        root = _make_trie_root()
+        result = trie_lookup_hsts(root, "example.app", ("app",), "app")
+        assert result == (True, "HSTS_TLD")
+
+    def test_hsts_exact_domain(self) -> None:
+        root = _make_trie_root()
+        trie_insert_hsts(root, "example.com")
+        result = trie_lookup_hsts(root, "example.com", (), "com")
+        assert result == (True, "HSTS")
+
+    def test_hsts_suffix_walk_hits_parent(self) -> None:
+        """'sub.example.com' hits 'example.com' via suffix walk."""
+        hsts_db: dict = {"example.com": 0}
+        root = _make_trie_root()
+        trie_insert_hsts(root, "example.com")
+        expected = hsts_check_domain("sub.example.com", hsts_db, (), "com")
+        got = trie_lookup_hsts(root, "sub.example.com", (), "com")
+        assert got == expected == (True, "HSTS")
+
+    def test_hsts_stride2_skips_cd(self) -> None:
+        """Stride-2: 'c.d' is never checked for query 'a.b.c.d' (pinned from Phase 3)."""
+        hsts_db: dict = {"c.d": 0}
+        root = _make_trie_root()
+        trie_insert_hsts(root, "c.d")
+        # dict oracle also skips "c.d"
+        expected = hsts_check_domain("a.b.c.d", hsts_db, (), "d")
+        got = trie_lookup_hsts(root, "a.b.c.d", (), "d")
+        assert expected == (False, "Python")
+        assert got == expected
+
+    def test_hsts_stride2_hits_second_position(self) -> None:
+        """Stride-2: second position checked is 'b.c.d' for query 'a.b.c.d'."""
+        hsts_db: dict = {"b.c.d": 0}
+        root = _make_trie_root()
+        trie_insert_hsts(root, "b.c.d")
+        expected = hsts_check_domain("a.b.c.d", hsts_db, (), "d")
+        got = trie_lookup_hsts(root, "a.b.c.d", (), "d")
+        assert expected == (True, "HSTS")
+        assert got == expected
+
+    def test_hsts_no_match(self) -> None:
+        root = _make_trie_root()
+        trie_insert_hsts(root, "other.com")
+        result = trie_lookup_hsts(root, "example.com", (), "com")
+        assert result == (False, "Python")
