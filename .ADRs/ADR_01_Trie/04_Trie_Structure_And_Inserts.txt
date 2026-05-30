@@ -20,6 +20,8 @@ implementation (and the Phase 3 oracle tests), we de-risk the actual swap
 
 REQUIRED READING
 - .ADRs/ADR_01_Trie/ADR.md — Section 2 (TrieNode shape + semantics contract).
+- .ADRs/ADR_01_Trie/RESULTS/03_Results.md — Phase 3 handoff: test classes added,
+  add_* helper names/locations, and golden test coverage confirmed.
 - src/usr/local/pkg/pfblockerng/pfb_unbound.py — the pure matchers from Phases
   1-2 you must match: find_zone_match (zone wildcard incl self, returns matched
   parent), whitelist_check_domain (exact + www-strip + tld_seg-gated walk),

@@ -1414,9 +1414,8 @@ def whitelist_check_domain(name: str, white_db: dict[str, Any], tld_seg: int) ->
     return False
 
 
-def resolve_feed_group(index: Any) -> tuple[Any, Any]:
-    global feedGroupIndexDB
-    feedGroup = feedGroupIndexDB.get(index)
+def resolve_feed_group(index: Any, feed_group_index_db: dict[int, Any]) -> tuple[Any, Any]:
+    feedGroup = feed_group_index_db.get(index)
     if feedGroup is not None:
         return feedGroup["feed"], feedGroup["group"]
     return "Unknown", "Unknown"
@@ -1484,8 +1483,7 @@ def evaluate_domain(
             if data_entry is not None:
                 is_found = True
                 log_type = data_entry["log"]
-                fg = feed_group_index_db.get(data_entry["index"])
-                feed, group = (fg["feed"], fg["group"]) if fg is not None else ("Unknown", "Unknown")
+                feed, group = resolve_feed_group(data_entry["index"], feed_group_index_db)
                 b_type = "DNSBL"
                 b_eval = q_name
 
@@ -1494,8 +1492,7 @@ def evaluate_domain(
             if matched_q is not None and zone_entry is not None:
                 is_found = True
                 log_type = zone_entry["log"]
-                fg = feed_group_index_db.get(zone_entry["index"])
-                feed, group = (fg["feed"], fg["group"]) if fg is not None else ("Unknown", "Unknown")
+                feed, group = resolve_feed_group(zone_entry["index"], feed_group_index_db)
                 b_type = "TLD"
                 b_eval = matched_q
 

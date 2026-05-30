@@ -22,6 +22,8 @@ that entry point and a parallel one for the noAAAA path.
 
 REQUIRED READING
 - .ADRs/ADR_01_Trie/ADR.md  — Section 2 semantics contract; Section 4 Phase 2.
+- .ADRs/ADR_01_Trie/RESULTS/01_Results.md — Phase 1 handoff: functions added,
+  call sites updated in operate(), and the signature convention for Phase 2.
 - src/usr/local/pkg/pfblockerng/pfb_unbound.py
     * operate() DNSBL block — the per-`q_name` loop (`for val_counter, q_name in
       enumerate(validate, start=1)`), specifically:

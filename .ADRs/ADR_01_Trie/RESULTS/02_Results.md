@@ -61,7 +61,11 @@ def evaluate_domain(
 
 Note: `regexDB` matching is performed inline in `evaluate_domain` (iterating over
 `regex_db.items()`) rather than calling `pfb_regex_match()` which reads the global.
-`feedGroupIndexDB` lookup is also inlined (was `resolve_feed_group()` reading global).
+
+`resolve_feed_group` was updated to accept `feed_group_index_db` as a second
+parameter (instead of reading the module global), making it pure and callable from
+`evaluate_domain`. Signature is now `resolve_feed_group(index, feed_group_index_db)`
+and it is called for both the data and zone hit branches inside `evaluate_domain`.
 
 ## evaluate_noaaaa signature
 

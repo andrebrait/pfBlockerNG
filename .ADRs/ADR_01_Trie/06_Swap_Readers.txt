@@ -20,6 +20,8 @@ hsts path — not scattered through operate().
 
 REQUIRED READING
 - .ADRs/ADR_01_Trie/ADR.md — Section 2 semantics contract; Section 4 Phase 6.
+- .ADRs/ADR_01_Trie/RESULTS/05_Results.md — Phase 5 handoff: domainTrie init
+  location, which loaders dual-write, and the consistency-check result.
 - src/usr/local/pkg/pfblockerng/pfb_unbound.py
     * evaluate_domain() — the data/zone/whitelist/hsts lookup calls (from Phase 2).
     * evaluate_noaaaa() — the exact/wildcard-parent lookup (from Phase 2).

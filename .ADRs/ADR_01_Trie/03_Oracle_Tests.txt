@@ -24,6 +24,9 @@ only the helper body.
 
 REQUIRED READING
 - .ADRs/ADR_01_Trie/ADR.md — Section 2 (the semantics contract you are pinning).
+- .ADRs/ADR_01_Trie/RESULTS/02_Results.md — Phase 2 handoff: DnsblDecision shape,
+  evaluate_domain/evaluate_noaaaa signatures, cfg/containers split, noAAAA memo
+  write location, and any corrections made post-phase.
 - src/usr/local/pkg/pfblockerng/pfb_unbound.py — the Phase 1/2 functions:
   iter_domain_suffixes, resolve_feed_group, hsts_check_domain, find_zone_match,
   find_noaaaa_wildcard_parent, whitelist_check_domain, evaluate_domain,
