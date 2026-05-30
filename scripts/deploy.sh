@@ -59,11 +59,6 @@ fi
 
 echo "==> Deploying pfBlockerNG ($CHANNEL) to $SSH_TARGET"
 
-# Substitute %%PKGNAME%% in info.xml before syncing
-sed "s|%%PKGNAME%%|${PKG_NAME}|g" \
-    "${REPO_ROOT}/src/usr/local/share/pfSense-pkg-pfBlockerNG/info.xml" \
-    > "${REPO_ROOT}/.info.xml.tmp"
-
 # Sync all source files, preserving permissions
 rsync -az --rsync-path="rsync" \
     --exclude="*.pyc" \
@@ -71,15 +66,18 @@ rsync -az --rsync-path="rsync" \
     "${REPO_ROOT}/src/usr/" \
     "${SSH_TARGET}:${PKG_PREFIX}/"
 
-# Replace info.xml with the substituted version
-rsync -az "${REPO_ROOT}/.info.xml.tmp" \
-    "${SSH_TARGET}:${PKG_PREFIX}/local/share/pfSense-pkg-pfBlockerNG/info.xml"
-
-rm -f "${REPO_ROOT}/.info.xml.tmp"
-
 rsync -az --rsync-path="rsync" \
     "${REPO_ROOT}/src/etc/" \
     "${SSH_TARGET}:/etc/"
+
+# Substitute %%PKGNAME%% in info.xml and sync to the channel-specific directory
+sed "s|%%PKGNAME%%|${PKG_NAME}|g" \
+    "${REPO_ROOT}/src/usr/local/share/pfSense-pkg-pfBlockerNG/info.xml" \
+    > "${REPO_ROOT}/.info.xml.tmp"
+ssh "$SSH_TARGET" mkdir -p "${PKG_PREFIX}/share/pfSense-pkg-${PKG_NAME}"
+rsync -az "${REPO_ROOT}/.info.xml.tmp" \
+    "${SSH_TARGET}:${PKG_PREFIX}/share/pfSense-pkg-${PKG_NAME}/info.xml"
+rm -f "${REPO_ROOT}/.info.xml.tmp"
 
 echo "==> Files synced. Restarting services..."
 
