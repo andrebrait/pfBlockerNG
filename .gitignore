@@ -1,0 +1,26 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.mypy_cache/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Editor temporaries ────────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+
+# ── Build / release artefacts ─────────────────────────────────────────────────
+*.tar.gz
+*.tar.bz2
+*.zip

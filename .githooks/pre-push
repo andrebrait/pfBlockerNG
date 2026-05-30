@@ -1,0 +1,61 @@
+#!/bin/sh
+# Enforces tag naming convention before any push.
+#
+# Rules:
+#   - vX.X.X        -> commit must be reachable from origin/main
+#   - vX.X.X-devel  -> commit must be reachable from origin/devel
+#                      but NOT yet merged into origin/main
+#   - Neither branch -> rejected
+#
+# Enable: git config core.hooksPath .githooks
+
+z40="0000000000000000000000000000000000000000"
+
+while IFS=' ' read -r local_ref local_sha remote_ref _remote_sha; do
+    # Only inspect tag pushes
+    case "$remote_ref" in refs/tags/*) ;; *) continue ;; esac
+
+    # Skip tag deletions
+    [ "$local_sha" = "$z40" ] && continue
+
+    tag="${remote_ref#refs/tags/}"
+
+    # Only enforce versioned tags (vX.X.X or vX.X.X-*)
+    case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) continue ;; esac
+
+    # Dereference annotated tags to the underlying commit
+    commit=$(git rev-parse --verify "${local_sha}^{commit}" 2>/dev/null) \
+        || commit="$local_sha"
+
+    on_main=0
+    on_devel=0
+    git merge-base --is-ancestor "$commit" "origin/main"  2>/dev/null && on_main=1
+    git merge-base --is-ancestor "$commit" "origin/devel" 2>/dev/null && on_devel=1
+
+    if [ "$on_main" = 0 ] && [ "$on_devel" = 0 ]; then
+        echo "error: '$tag' does not point to a commit reachable from 'origin/main' or 'origin/devel'" >&2
+        echo "       Push the commit to the appropriate branch and wait for CI to pass before tagging." >&2
+        exit 1
+    fi
+
+    # A commit merged into main must use the plain vX.X.X form
+    if [ "$on_main" = 1 ]; then
+        case "$tag" in
+            *-devel)
+                echo "error: '$tag' points to a commit on 'main'; use vX.X.X (drop the -devel suffix)" >&2
+                exit 1
+                ;;
+        esac
+    # A commit only on devel must use the vX.X.X-devel form
+    elif [ "$on_devel" = 1 ]; then
+        case "$tag" in
+            *-devel) ;;
+            *)
+                echo "error: '$tag' points to a commit only on 'devel'; use vX.X.X-devel" >&2
+                exit 1
+                ;;
+        esac
+    fi
+done
+
+exit 0
