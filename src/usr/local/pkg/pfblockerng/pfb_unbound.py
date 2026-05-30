@@ -27,6 +27,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -1437,6 +1438,129 @@ def hsts_check_domain(
     return False, "Python"
 
 
+@dataclass
+class DnsblDecision:
+    is_found: bool
+    in_whitelist: bool
+    in_hsts: bool
+    null_blocking: bool
+    log_type: Any
+    b_type: str
+    p_type: str
+    feed: Any
+    group: Any
+    b_eval: str
+
+
+def evaluate_domain(
+    q_name: str,
+    q_name_original: str,
+    tld: str,
+    is_cname: bool,
+    cfg: dict[str, Any],
+    containers: dict[str, Any],
+) -> DnsblDecision:
+    is_found = False
+    log_type: Any = False
+    in_whitelist = False
+    in_hsts = False
+    null_blocking = True
+    b_type = "Python"
+    p_type = "Python"
+    feed: Any = "Unknown"
+    group: Any = "Unknown"
+    b_eval = ""
+
+    data_db: dict[str, Any] = containers["dataDB"]
+    zone_db: dict[str, Any] = containers["zoneDB"]
+    white_db: dict[str, Any] = containers["whiteDB"]
+    regex_db: dict[str, Any] = containers["regexDB"]
+    feed_group_index_db: dict[int, Any] = containers["feedGroupIndexDB"]
+    hsts_db: dict[str, Any] = containers["hstsDB"]
+
+    if cfg["python_blocking"]:
+        if cfg["dataDB"]:
+            data_entry = data_db.get(q_name)
+            if data_entry is not None:
+                is_found = True
+                log_type = data_entry["log"]
+                fg = feed_group_index_db.get(data_entry["index"])
+                feed, group = (fg["feed"], fg["group"]) if fg is not None else ("Unknown", "Unknown")
+                b_type = "DNSBL"
+                b_eval = q_name
+
+        if not is_found and cfg["zoneDB"]:
+            matched_q, zone_entry = find_zone_match(q_name, zone_db)
+            if matched_q is not None and zone_entry is not None:
+                is_found = True
+                log_type = zone_entry["log"]
+                fg = feed_group_index_db.get(zone_entry["index"])
+                feed, group = (fg["feed"], fg["group"]) if fg is not None else ("Unknown", "Unknown")
+                b_type = "TLD"
+                b_eval = matched_q
+
+    if not is_found:
+        if (
+            cfg["python_tld"]
+            and tld != ""
+            and q_name not in (cfg["dnsbl_ipv4"], cfg["dnsbl_ipv6"])
+            and tld not in cfg["python_tlds"]
+        ):
+            is_found = True
+            feed = "TLD_Allow"
+            group = "DNSBL_TLD_Allow"
+
+        if not is_found and cfg["python_idn"] and is_idn_domain(q_name):
+            is_found = True
+            feed = "IDN"
+            group = "DNSBL_IDN"
+
+        if not is_found and cfg["regexDB"]:
+            for k, r in regex_db.items():
+                if r.search(q_name):
+                    is_found = True
+                    feed = k
+                    group = "DNSBL_Regex"
+                    break
+
+        if is_found:
+            b_eval = q_name
+            log_type = "1"
+
+    if is_found and cfg["whiteDB"]:
+        names = [q_name] + ([q_name_original] if is_cname else [])
+        in_whitelist = any(whitelist_check_domain(n, white_db, cfg["python_tld_seg"]) for n in names)
+
+    if is_found and not in_whitelist:
+        if cfg["hstsDB"]:
+            in_hsts, p_type = hsts_check_domain(q_name, hsts_db, cfg["hsts_tlds"], tld)
+
+        if log_type == "1" and not in_hsts:
+            null_blocking = False
+
+        if is_cname:
+            b_type = b_type + "_CNAME"
+
+    return DnsblDecision(
+        is_found=is_found,
+        in_whitelist=in_whitelist,
+        in_hsts=in_hsts,
+        null_blocking=null_blocking,
+        log_type=log_type,
+        b_type=b_type,
+        p_type=p_type,
+        feed=feed,
+        group=group,
+        b_eval=b_eval,
+    )
+
+
+def evaluate_noaaaa(q_name: str, noaaaa_db: dict[str, Any]) -> bool:
+    if noaaaa_db.get(q_name) is not None:
+        return True
+    return find_noaaaa_wildcard_parent(q_name, noaaaa_db) is not None
+
+
 def operate(id: int, event: int, qstate: module_qstate, qdata: Any) -> bool:
     global pfb, threads, dataDB, zoneDB, hstsDB, whiteDB, excludeDB, excludeAAAADB
     global excludeSS, dnsblDB, noAAAADB, gpListDB, safeSearchDB
@@ -1460,22 +1584,13 @@ def operate(id: int, event: int, qstate: module_qstate, qdata: Any) -> bool:
     if (event == MODULE_EVENT_NEW) or (event == MODULE_EVENT_PASS):
         # no AAAA validation
         if qstate_valid and q_type == RR_TYPE_AAAA and pfb["noAAAADB"] and q_name_original not in excludeAAAADB:
-            isin_noAAAA = False
-
-            # Determine full domain match
-            isnoAAAA = noAAAADB.get(q_name_original)
-            if isnoAAAA is not None:
-                isin_noAAAA = True
-
-            # Wildcard verification of domain
-            if not isin_noAAAA:
-                parent = find_noaaaa_wildcard_parent(q_name_original, noAAAADB)
-                if parent is not None:
-                    isin_noAAAA = True
-                    noAAAADB[q_name_original] = True
+            isin_noAAAA = evaluate_noaaaa(q_name_original, noAAAADB)
 
             # Create FQDN Reply Message (AAAA -> A)
             if isin_noAAAA:
+                if noAAAADB.get(q_name_original) is None:
+                    noAAAADB[q_name_original] = True
+
                 msg = DNSMessage(qstate.qinfo.qname_str, RR_TYPE_A, RR_CLASS_IN, PKT_QR | PKT_RA)
                 if msg is None or not msg.set_return_msg(qstate):
                     qstate.ext_state[id] = MODULE_ERROR
@@ -1733,108 +1848,54 @@ def operate(id: int, event: int, qstate: module_qstate, qdata: Any) -> bool:
             # Determine if domain has been previously validated
             if q_name not in excludeDB:
                 isFound = False
-                log_type: Any = False
                 isInWhitelist = False
-                isInHsts = False
                 nullBlocking = True
-                b_type = "Python"
-                p_type = "Python"
-                feed: Any = "Unknown"
-                group = "Unknown"
-                b_eval = ""
-
-                # print "v0: " + q_name
 
                 # Determine if domain was previously DNSBL blocked
                 isDomainInDNSBL = dnsblDB.get(q_name)
                 if isDomainInDNSBL is None:
                     tld = get_tld(qstate)
-
-                    # Determine if domain is in DNSBL 'data|zone' database
-                    if pfb["python_blocking"]:
-                        # Determine if domain is in DNSBL 'data' database (log to dnsbl.log)
-                        isDomainInData: Any = False
-                        if pfb["dataDB"]:
-                            isDomainInData = dataDB.get(q_name)
-                            if isDomainInData is not None:
-                                # print q_name + ' data: ' + str(isDomainInData)
-                                isFound = True
-                                log_type = isDomainInData["log"]
-
-                                # Collect Feed/Group
-                                feed, group = resolve_feed_group(isDomainInData["index"])
-
-                                b_type = "DNSBL"
-                                b_eval = q_name
-
-                        # Determine if domain is in DNSBL 'zone' database (log to dnsbl.log)
-                        if not isFound and pfb["zoneDB"]:
-                            matched_q, zone_entry = find_zone_match(q_name, zoneDB)
-                            if matched_q is not None and zone_entry is not None:
-                                isFound = True
-                                log_type = zone_entry["log"]
-
-                                # Collect Feed/Group
-                                feed, group = resolve_feed_group(zone_entry["index"])
-
-                                b_type = "TLD"
-                                b_eval = matched_q
-
-                    # Validate other python methods, if not blocked via DNSBL zone/data
-                    if not isFound:
-                        # Allow only approved TLDs
-                        if (
-                            pfb["python_tld"]
-                            and tld != ""
-                            and q_name not in (pfb["dnsbl_ipv4"], pfb["dnsbl_ipv6"])
-                            and tld not in pfb["python_tlds"]
-                        ):
-                            isFound = True
-                            feed = "TLD_Allow"
-                            group = "DNSBL_TLD_Allow"
-
-                        # Block IDN or 'xn--' Domains
-                        if not isFound and pfb["python_idn"] and is_idn_domain(q_name):
-                            isFound = True
-                            feed = "IDN"
-                            group = "DNSBL_IDN"
-
-                        # Block via Regex
-                        if not isFound and pfb["regexDB"]:
-                            isRegexMatch = pfb_regex_match(q_name)
-                            # print q_name + ' regex: ' + str(isRegexMatch)
-                            if isRegexMatch:
-                                isFound = True
-                                feed = isRegexMatch
-                                group = "DNSBL_Regex"
-
-                        if isFound:
-                            b_eval = q_name
-                            log_type = "1"
-
-                    # Validate domain in DNSBL Whitelist
-                    if isFound and pfb["whiteDB"]:
-                        names = [q_name] + ([q_name_original] if isCNAME else [])
-                        isInWhitelist = any(whitelist_check_domain(n, whiteDB, pfb["python_tld_seg"]) for n in names)
+                    cfg = {
+                        "python_blocking": pfb["python_blocking"],
+                        "dataDB": pfb["dataDB"],
+                        "zoneDB": pfb["zoneDB"],
+                        "python_tld": pfb["python_tld"],
+                        "python_tlds": pfb["python_tlds"],
+                        "dnsbl_ipv4": pfb["dnsbl_ipv4"],
+                        "dnsbl_ipv6": pfb["dnsbl_ipv6"],
+                        "python_idn": pfb["python_idn"],
+                        "regexDB": pfb["regexDB"],
+                        "whiteDB": pfb["whiteDB"],
+                        "python_tld_seg": pfb["python_tld_seg"],
+                        "hstsDB": pfb["hstsDB"],
+                        "hsts_tlds": pfb["hsts_tlds"],
+                    }
+                    containers = {
+                        "dataDB": dataDB,
+                        "zoneDB": zoneDB,
+                        "whiteDB": whiteDB,
+                        "regexDB": regexDB,
+                        "feedGroupIndexDB": feedGroupIndexDB,
+                        "hstsDB": hstsDB,
+                    }
+                    dec = evaluate_domain(q_name, q_name_original, tld, isCNAME, cfg, containers)
+                    isFound = dec.is_found
+                    isInWhitelist = dec.in_whitelist
+                    nullBlocking = dec.null_blocking
+                    b_type = dec.b_type
+                    p_type = dec.p_type
+                    log_type = dec.log_type
+                    feed = dec.feed
+                    group = dec.group
+                    b_eval = dec.b_eval
 
                     # Add domain to excludeDB to skip subsequent blacklist validation
                     if not isFound or isInWhitelist:
-                        # print "Add to Pass: " + q_name
                         excludeDB.append(q_name)
 
                     # Domain to be blocked and is not whitelisted
                     if isFound and not isInWhitelist:
-                        # Determine if domain is in HSTS database (Null blocking)
-                        if pfb["hstsDB"]:
-                            isInHsts, p_type = hsts_check_domain(q_name, hstsDB, pfb["hsts_tlds"], tld)
-
-                        # Determine blocked IP type (DNSBL VIP vs Null Blocking)
-                        if log_type == "1" and not isInHsts:
-                            nullBlocking = False
-
-                        # Add 'CNAME' suffix to Block type (CNAME Validation)
                         if isCNAME:
-                            b_type = b_type + "_CNAME"
                             q_name = q_name_original
 
                         # Skip subsequent DNSBL validation for domain, add to dict for get_details_dnsbl
@@ -1869,7 +1930,6 @@ def operate(id: int, event: int, qstate: module_qstate, qdata: Any) -> bool:
                 else:
                     nullBlocking = isDomainInDNSBL["null"]
                     isFound = True
-                    # print "v: " + q_name
 
                 if isFound and not isInWhitelist:
                     # Create FQDN Reply Message
