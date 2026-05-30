@@ -1,9 +1,8 @@
 <?xml version="1.0"?>
 <pfsensepkgs>
 	<package>
-		<name>pfBlockerNG</name>
-		<descr><![CDATA[
-			Manage IPv4/v6 List Sources into 'Deny, Permit or Match' formats.&lt;br /&gt;
+		<name>%%PKGNAME%%</name>
+		<descr><![CDATA[Manage IPv4/v6 List Sources into 'Deny, Permit or Match' formats.&lt;br /&gt;
 			GeoIP database by MaxMind Inc. (GeoLite2 Free version).&lt;br /&gt;
 			De-Duplication, Suppression, and Reputation enhancements.&lt;br /&gt;
 			Provision to download from diverse List formats.&lt;br /&gt;

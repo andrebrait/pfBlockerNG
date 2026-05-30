@@ -52,19 +52,33 @@ if [ "$CHANNEL" != "devel" ] && [ "$CHANNEL" != "stable" ]; then
 fi
 
 PKG_PREFIX="/usr/local"
+PKG_NAME="pfBlockerNG"
+if [ "$CHANNEL" = "devel" ]; then
+    PKG_NAME="pfBlockerNG-devel"
+fi
 
 echo "==> Deploying pfBlockerNG ($CHANNEL) to $SSH_TARGET"
 
+# Substitute %%PKGNAME%% in info.xml before syncing
+sed "s|%%PKGNAME%%|${PKG_NAME}|g" \
+    "${REPO_ROOT}/src/usr/local/share/pfSense-pkg-pfBlockerNG/info.xml" \
+    > "${REPO_ROOT}/.info.xml.tmp"
+
 # Sync all source files, preserving permissions
 rsync -az --rsync-path="rsync" \
-    --exclude="tests/" \
     --exclude="*.pyc" \
     --exclude="__pycache__/" \
-    "${REPO_ROOT}/usr/" \
+    "${REPO_ROOT}/src/usr/" \
     "${SSH_TARGET}:${PKG_PREFIX}/"
 
+# Replace info.xml with the substituted version
+rsync -az "${REPO_ROOT}/.info.xml.tmp" \
+    "${SSH_TARGET}:${PKG_PREFIX}/local/share/pfSense-pkg-pfBlockerNG/info.xml"
+
+rm -f "${REPO_ROOT}/.info.xml.tmp"
+
 rsync -az --rsync-path="rsync" \
-    "${REPO_ROOT}/etc/" \
+    "${REPO_ROOT}/src/etc/" \
     "${SSH_TARGET}:/etc/"
 
 echo "==> Files synced. Restarting services..."
