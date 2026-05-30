@@ -1,6 +1,8 @@
 import builtins
+import random
 import re
 import types
+from collections import defaultdict
 
 import pytest
 
@@ -17,12 +19,57 @@ MODULE_WAIT_MODULE = builtins.MODULE_WAIT_MODULE
 MODULE_ERROR = builtins.MODULE_ERROR
 RCODE_NOERROR = builtins.RCODE_NOERROR
 from pfb_unbound import (
+    DnsblDecision,
     convert_ipv4,
     convert_ipv6,
     convert_other,
+    evaluate_domain,
+    evaluate_noaaaa,
+    find_noaaaa_wildcard_parent,
+    find_zone_match,
+    hsts_check_domain,
     is_unknown,
+    iter_domain_suffixes,
     python_control_duration,
+    resolve_feed_group,
+    whitelist_check_domain,
 )
+
+# ---------------------------------------------------------------------------
+# Test-only insert helpers
+# Each helper writes into the module-level container AND sets the enabling
+# pfb[...] flag, so tests don't need to touch module internals directly.
+# Phase 4+ will swap the container type; only the helper bodies change.
+# ---------------------------------------------------------------------------
+
+
+def add_data(domain: str, log: str = "1", index: int = 0) -> None:
+    pfb_unbound.dataDB[domain] = {"log": log, "index": index}
+    pfb_unbound.pfb["dataDB"] = True
+
+
+def add_zone(domain: str, log: str = "1", index: int = 0) -> None:
+    pfb_unbound.zoneDB[domain] = {"log": log, "index": index}
+    pfb_unbound.pfb["zoneDB"] = True
+
+
+def add_white(domain: str, wildcard: bool = False) -> None:
+    pfb_unbound.whiteDB[domain] = wildcard
+    pfb_unbound.pfb["whiteDB"] = True
+
+
+def add_noaaaa(domain: str, wildcard: bool = False) -> None:
+    pfb_unbound.noAAAADB[domain] = wildcard
+    pfb_unbound.pfb["noAAAADB"] = True
+
+
+def add_hsts(domain: str) -> None:
+    pfb_unbound.hstsDB[domain] = 0
+    pfb_unbound.pfb["hstsDB"] = True
+
+
+def set_feed_group(index: int, feed: str, group: str) -> None:
+    pfb_unbound.feedGroupIndexDB[index] = {"feed": feed, "group": group}
 
 
 class TestIsUnknown:
@@ -519,12 +566,8 @@ RR_TXT = 16
 
 
 class TestOperateNoAAAA:
-    def _enable(self):
-        pfb_unbound.pfb["noAAAADB"] = True
-
     def test_exact_match_blocks(self, monkeypatch):
-        self._enable()
-        pfb_unbound.noAAAADB["example.com"] = False
+        add_noaaaa("example.com", wildcard=False)
         qstate = make_qstate("example.com.", qtype=RR_AAAA)
         rcd = pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
         assert rcd is True
@@ -532,8 +575,7 @@ class TestOperateNoAAAA:
         assert qstate.return_rcode == RCODE_NOERROR
 
     def test_wildcard_blocks_subdomain_and_caches(self):
-        self._enable()
-        pfb_unbound.noAAAADB["example.com"] = True
+        add_noaaaa("example.com", wildcard=True)
         qstate = make_qstate("sub.example.com.", qtype=RR_AAAA)
         rcd = pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
         assert rcd is True
@@ -541,23 +583,20 @@ class TestOperateNoAAAA:
         assert pfb_unbound.noAAAADB.get("sub.example.com") is True
 
     def test_excluded_domain_not_blocked(self):
-        self._enable()
-        pfb_unbound.noAAAADB["example.com"] = False
+        add_noaaaa("example.com", wildcard=False)
         pfb_unbound.excludeAAAADB.append("example.com")
         qstate = make_qstate("example.com.", qtype=RR_AAAA)
         pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
         assert qstate.ext_state[0] == MODULE_WAIT_MODULE
 
     def test_non_aaaa_skips_logic(self):
-        self._enable()
-        pfb_unbound.noAAAADB["example.com"] = False
+        add_noaaaa("example.com", wildcard=False)
         qstate = make_qstate("example.com.", qtype=RR_A)
         pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
         assert qstate.ext_state[0] == MODULE_WAIT_MODULE
 
     def test_no_match_adds_to_exclude(self):
-        self._enable()
-        pfb_unbound.noAAAADB["other.com"] = True
+        add_noaaaa("other.com", wildcard=True)
         qstate = make_qstate("example.com.", qtype=RR_AAAA)
         pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
         assert "example.com" in pfb_unbound.excludeAAAADB
@@ -573,9 +612,8 @@ class TestOperateDnsbl:
 
     def test_data_lookup_blocks_with_dnsbl_ipv4(self, monkeypatch):
         self._enable(monkeypatch)
-        pfb_unbound.pfb["dataDB"] = True
-        pfb_unbound.dataDB["evil.com"] = {"log": "1", "index": 0}
-        pfb_unbound.feedGroupIndexDB[0] = {"feed": "TestFeed", "group": "TestGroup"}
+        add_data("evil.com", log="1", index=0)
+        set_feed_group(0, "TestFeed", "TestGroup")
         qstate = make_qstate("evil.com.", qtype=RR_A)
         rcd = pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
         assert rcd is True
@@ -586,9 +624,8 @@ class TestOperateDnsbl:
 
     def test_zone_lookup_matches_subdomain(self, monkeypatch):
         self._enable(monkeypatch)
-        pfb_unbound.pfb["zoneDB"] = True
-        pfb_unbound.zoneDB["example.com"] = {"log": "1", "index": 0}
-        pfb_unbound.feedGroupIndexDB[0] = {"feed": "TestFeed", "group": "TestGroup"}
+        add_zone("example.com", log="1", index=0)
+        set_feed_group(0, "TestFeed", "TestGroup")
         qstate = make_qstate("sub.example.com.", qtype=RR_A)
         rcd = pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
         assert rcd is True
@@ -596,11 +633,9 @@ class TestOperateDnsbl:
 
     def test_whitelist_override_not_blocked(self, monkeypatch):
         self._enable(monkeypatch)
-        pfb_unbound.pfb["dataDB"] = True
-        pfb_unbound.pfb["whiteDB"] = True
-        pfb_unbound.dataDB["evil.com"] = {"log": "1", "index": 0}
-        pfb_unbound.feedGroupIndexDB[0] = {"feed": "TestFeed", "group": "TestGroup"}
-        pfb_unbound.whiteDB["evil.com"] = False
+        add_data("evil.com", log="1", index=0)
+        set_feed_group(0, "TestFeed", "TestGroup")
+        add_white("evil.com", wildcard=False)
         qstate = make_qstate("evil.com.", qtype=RR_A)
         pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
         assert qstate.ext_state[0] == MODULE_WAIT_MODULE
@@ -619,9 +654,8 @@ class TestOperateDnsbl:
 
     def test_excludedb_short_circuit(self, monkeypatch):
         self._enable(monkeypatch)
-        pfb_unbound.pfb["dataDB"] = True
-        pfb_unbound.dataDB["evil.com"] = {"log": "1", "index": 0}
-        pfb_unbound.feedGroupIndexDB[0] = {"feed": "TestFeed", "group": "TestGroup"}
+        add_data("evil.com", log="1", index=0)
+        set_feed_group(0, "TestFeed", "TestGroup")
         pfb_unbound.excludeDB.append("evil.com")
         qstate = make_qstate("evil.com.", qtype=RR_A)
         pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
@@ -629,10 +663,9 @@ class TestOperateDnsbl:
 
     def test_group_policy_bypass(self, monkeypatch):
         self._enable(monkeypatch)
-        pfb_unbound.pfb["dataDB"] = True
+        add_data("evil.com", log="1", index=0)
+        set_feed_group(0, "TestFeed", "TestGroup")
         pfb_unbound.pfb["gpListDB"] = True
-        pfb_unbound.dataDB["evil.com"] = {"log": "1", "index": 0}
-        pfb_unbound.feedGroupIndexDB[0] = {"feed": "TestFeed", "group": "TestGroup"}
         pfb_unbound.gpListDB["1.2.3.4"] = 0
         qstate = make_qstate("evil.com.", qtype=RR_A, q_ip="1.2.3.4")
         pfb_unbound.operate(0, MODULE_EVENT_NEW, qstate, None)
@@ -651,3 +684,571 @@ class TestOperateEvents:
         rcd = pfb_unbound.operate(0, 99, qstate, None)
         assert rcd is True
         assert qstate.ext_state[0] == MODULE_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Oracle / property tests for pure domain-match helpers
+# ---------------------------------------------------------------------------
+
+
+class TestIterDomainSuffixes:
+    def test_single_label(self):
+        assert list(iter_domain_suffixes("com")) == ["com"]
+
+    def test_two_labels(self):
+        assert list(iter_domain_suffixes("example.com")) == ["example.com", "com"]
+
+    def test_three_labels(self):
+        assert list(iter_domain_suffixes("sub.example.com")) == ["sub.example.com", "example.com", "com"]
+
+    def test_empty_string(self):
+        # Empty string has no dots; yields one item (the empty string itself)
+        assert list(iter_domain_suffixes("")) == [""]
+
+
+class TestFindZoneMatch:
+    def test_exact_self_match(self):
+        zone_db = {"example.com": {"log": "1", "index": 0}}
+        matched, entry = find_zone_match("example.com", zone_db)
+        assert matched == "example.com"
+        assert entry == {"log": "1", "index": 0}
+
+    def test_subdomain_matches_parent_zone(self):
+        zone_db = {"example.com": {"log": "1", "index": 0}}
+        matched, entry = find_zone_match("sub.example.com", zone_db)
+        assert matched == "example.com"
+        assert entry is not None
+
+    def test_deep_subdomain_matches(self):
+        zone_db = {"example.com": {"log": "1", "index": 0}}
+        matched, entry = find_zone_match("a.b.example.com", zone_db)
+        assert matched == "example.com"
+
+    def test_no_match_returns_none_none(self):
+        zone_db = {"evil.com": {"log": "1", "index": 0}}
+        matched, entry = find_zone_match("good.com", zone_db)
+        assert matched is None
+        assert entry is None
+
+    def test_data_exact_not_wildcard(self):
+        # dataDB uses exact only; simulate: zone_db contains 'evil.com'
+        # but query is 'x.evil.com' — zone DOES match (wildcard incl. self),
+        # while a separate exact-only check would not.
+        # This test pins that find_zone_match IS the wildcard matcher.
+        zone_db = {"evil.com": {"log": "1", "index": 0}}
+        matched, _ = find_zone_match("x.evil.com", zone_db)
+        assert matched == "evil.com"
+
+    def test_matched_parent_string_correct(self):
+        # b_eval = matched parent string; must be the zone key, not the query name
+        zone_db = {"example.com": {"log": "1", "index": 0}}
+        matched, _ = find_zone_match("deep.sub.example.com", zone_db)
+        assert matched == "example.com"
+
+    def test_most_specific_match_wins(self):
+        # iter_domain_suffixes walks q_name → ... TLD, so first hit is most specific
+        zone_db = {
+            "sub.example.com": {"log": "1", "index": 1},
+            "example.com": {"log": "1", "index": 2},
+        }
+        matched, entry = find_zone_match("sub.example.com", zone_db)
+        assert matched == "sub.example.com"
+        assert entry["index"] == 1
+
+
+class TestWhitelistCheckDomain:
+    def test_exact_match(self):
+        white_db: dict = {"allowed.com": False}
+        assert whitelist_check_domain("allowed.com", white_db, tld_seg=2) is True
+
+    def test_no_match(self):
+        white_db: dict = {"other.com": False}
+        assert whitelist_check_domain("allowed.com", white_db, tld_seg=2) is False
+
+    def test_www_strip(self):
+        # "www.allowed.com" → strips "www." → checks "allowed.com"
+        white_db: dict = {"allowed.com": False}
+        assert whitelist_check_domain("www.allowed.com", white_db, tld_seg=2) is True
+
+    def test_www_strip_not_triggered_for_non_www(self):
+        white_db: dict = {"allowed.com": False}
+        assert whitelist_check_domain("sub.allowed.com", white_db, tld_seg=2) is False
+
+    def test_suffix_walk_at_tld_seg_boundary_matches(self):
+        # "sub.evil.com": suffix walk starts at "evil.com" (x=2, tld_seg=2) → match
+        white_db: dict = {"evil.com": True}
+        assert whitelist_check_domain("sub.evil.com", white_db, tld_seg=2) is True
+
+    def test_suffix_walk_below_tld_seg_does_not_match(self):
+        # "evil.com": suffix walk starts at "com" (x=1, tld_seg=2) → 1 < 2 → no match
+        white_db: dict = {"com": True}
+        assert whitelist_check_domain("evil.com", white_db, tld_seg=2) is False
+
+    def test_suffix_walk_with_high_tld_seg_blocks_intermediate(self):
+        # "a.b.example.com" with tld_seg=3:
+        #   suffix walk q starts at "b.example.com", x counts down from 3:
+        #   x=3 >= 3 → check "b.example.com" (not in db)
+        #   x=2 < 3 → skip "example.com"  (below tld_seg gate)
+        white_db: dict = {"example.com": True}
+        assert whitelist_check_domain("a.b.example.com", white_db, tld_seg=3) is False
+
+    def test_suffix_walk_respects_tld_seg_allows_higher(self):
+        # Same domain but entry is at "b.example.com" (x=3 >= 3) → match
+        white_db: dict = {"b.example.com": True}
+        assert whitelist_check_domain("a.b.example.com", white_db, tld_seg=3) is True
+
+
+class TestFindNoaaaaWildcardParent:
+    def test_exact_name_not_matched_by_wildcard_fn(self):
+        # find_noaaaa_wildcard_parent starts from PARENT, so self is never checked
+        noaaaa_db: dict = {"example.com": True}
+        result = find_noaaaa_wildcard_parent("example.com", noaaaa_db)
+        assert result is None
+
+    def test_direct_parent_matched(self):
+        noaaaa_db: dict = {"example.com": True}
+        result = find_noaaaa_wildcard_parent("sub.example.com", noaaaa_db)
+        assert result == "example.com"
+
+    def test_grandparent_matched(self):
+        noaaaa_db: dict = {"example.com": True}
+        result = find_noaaaa_wildcard_parent("a.b.example.com", noaaaa_db)
+        assert result == "example.com"
+
+    def test_no_match_returns_none(self):
+        noaaaa_db: dict = {"other.com": True}
+        result = find_noaaaa_wildcard_parent("sub.example.com", noaaaa_db)
+        assert result is None
+
+    def test_wildcard_false_value_not_matched(self):
+        # noaaaa_db.get(q) is truthy check; wildcard=False means value is False → not matched
+        noaaaa_db: dict = {"example.com": False}
+        result = find_noaaaa_wildcard_parent("sub.example.com", noaaaa_db)
+        assert result is None
+
+    def test_single_label_parent_not_checked(self):
+        # "sub.com": parent = "com", but loop range(0, 0, -1) is empty → no check
+        noaaaa_db: dict = {"com": True}
+        result = find_noaaaa_wildcard_parent("sub.com", noaaaa_db)
+        assert result is None
+
+
+class TestEvaluateNoaaaa:
+    def test_exact_match_no_wildcard_flag(self):
+        # wildcard=False → value is False; get() returns False (not None) → is not None → True
+        noaaaa_db: dict = {"example.com": False}
+        assert evaluate_noaaaa("example.com", noaaaa_db) is True
+
+    def test_exact_match_wildcard_flag(self):
+        noaaaa_db: dict = {"example.com": True}
+        assert evaluate_noaaaa("example.com", noaaaa_db) is True
+
+    def test_wildcard_parent_matches_subdomain(self):
+        noaaaa_db: dict = {"example.com": True}
+        assert evaluate_noaaaa("sub.example.com", noaaaa_db) is True
+
+    def test_wildcard_false_does_not_match_subdomain(self):
+        # wildcard=False → find_noaaaa_wildcard_parent skips it (truthy check)
+        noaaaa_db: dict = {"example.com": False}
+        assert evaluate_noaaaa("sub.example.com", noaaaa_db) is False
+
+    def test_no_match(self):
+        noaaaa_db: dict = {"other.com": True}
+        assert evaluate_noaaaa("example.com", noaaaa_db) is False
+
+    def test_self_not_matched_by_wildcard_branch(self):
+        # find_noaaaa_wildcard_parent skips self; exact branch handles self
+        # wildcard entry on "example.com" → exact: "example.com" in db → True via exact
+        noaaaa_db: dict = {"example.com": True}
+        assert evaluate_noaaaa("example.com", noaaaa_db) is True
+
+
+class TestHstsCheckDomain:
+    def test_tld_in_hsts_tlds_returns_hsts_tld(self):
+        hsts_db: dict = {}
+        assert hsts_check_domain("example.app", hsts_db, ("app",), "app") == (True, "HSTS_TLD")
+
+    def test_tld_not_in_hsts_tlds_falls_through(self):
+        hsts_db: dict = {}
+        result = hsts_check_domain("example.com", hsts_db, ("app",), "com")
+        assert result == (False, "Python")
+
+    def test_exact_domain_in_hsts_db(self):
+        hsts_db: dict = {"example.com": 0}
+        result = hsts_check_domain("example.com", hsts_db, (), "com")
+        assert result == (True, "HSTS")
+
+    def test_suffix_walk_hits_parent(self):
+        # "sub.example.com" (2 dots): range(3,0,-2) → [3, 1]
+        # iter 0: check "sub.example.com" (miss), step → "example.com"
+        # iter 1: check "example.com" (hit)
+        hsts_db: dict = {"example.com": 0}
+        result = hsts_check_domain("sub.example.com", hsts_db, (), "com")
+        assert result == (True, "HSTS")
+
+    def test_stride_2_skips_alternate_label(self):
+        # "a.b.c.d" (3 dots): range(4,0,-2) → 2 iterations
+        # The loop runs twice: q starts at "a.b.c.d", then steps to "b.c.d".
+        # Positions checked: "a.b.c.d" (iter 0), "b.c.d" (iter 1).
+        # "c.d" is never checked (one more step would be needed).
+        # This pins the stride-2 quirk: "c.d" alone is NOT found.
+        hsts_db: dict = {"c.d": 0}
+        result = hsts_check_domain("a.b.c.d", hsts_db, (), "d")
+        assert result == (False, "Python")
+
+    def test_stride_2_hits_second_position(self):
+        # The second position checked is "b.c.d" (after one step from "a.b.c.d").
+        # A stride-1 walk would also check "c.d" and "d"; stride-2 stops after "b.c.d".
+        hsts_db: dict = {"b.c.d": 0}
+        result = hsts_check_domain("a.b.c.d", hsts_db, (), "d")
+        assert result == (True, "HSTS")
+
+    def test_no_match_returns_python(self):
+        hsts_db: dict = {"other.com": 0}
+        result = hsts_check_domain("example.com", hsts_db, (), "com")
+        assert result == (False, "Python")
+
+
+class TestResolveFeedGroup:
+    def test_hit_returns_feed_and_group(self):
+        fgidb = {0: {"feed": "MyFeed", "group": "MyGroup"}}
+        assert resolve_feed_group(0, fgidb) == ("MyFeed", "MyGroup")
+
+    def test_miss_returns_unknown_unknown(self):
+        fgidb: dict = {}
+        assert resolve_feed_group(99, fgidb) == ("Unknown", "Unknown")
+
+    def test_none_index_returns_unknown(self):
+        fgidb = {0: {"feed": "F", "group": "G"}}
+        assert resolve_feed_group(None, fgidb) == ("Unknown", "Unknown")
+
+
+# ---------------------------------------------------------------------------
+# Randomized property test for pure matchers
+# Seeded for reproducibility.
+# ---------------------------------------------------------------------------
+
+
+class TestPureMatcherProperties:
+    """Fuzz pure matchers against brute-force reference impls; seed=42."""
+
+    SEED = 42
+    LABELS = ["a", "bb", "cc", "example", "evil", "sub", "www", "foo", "bar", "xyz"]
+    TLDS = ["com", "net", "org", "io"]
+    N_ENTRIES = 30
+    N_QUERIES = 60
+
+    def _rand_domain(self, rng: random.Random, max_labels: int = 4) -> str:
+        n = rng.randint(1, max_labels)
+        parts = [rng.choice(self.LABELS) for _ in range(n - 1)] + [rng.choice(self.TLDS)]
+        return ".".join(parts)
+
+    def test_find_zone_match_vs_brute_force(self):
+        rng = random.Random(self.SEED)
+        zone_db: dict = {}
+        entries = [self._rand_domain(rng) for _ in range(self.N_ENTRIES)]
+        for d in entries:
+            zone_db[d] = {"log": "1", "index": 0}
+
+        def brute_zone(q: str) -> str | None:
+            # Check every suffix from most-specific to least-specific
+            parts = q.split(".")
+            for i in range(len(parts)):
+                suffix = ".".join(parts[i:])
+                if suffix in zone_db:
+                    return suffix
+            return None
+
+        for _ in range(self.N_QUERIES):
+            q = self._rand_domain(rng)
+            expected = brute_zone(q)
+            matched, _ = find_zone_match(q, zone_db)
+            assert matched == expected, f"find_zone_match({q!r}) -> {matched!r}, expected {expected!r}"
+
+    def test_whitelist_check_domain_vs_brute_force(self):
+        rng = random.Random(self.SEED + 1)
+        white_db: dict = {}
+        entries = [self._rand_domain(rng) for _ in range(self.N_ENTRIES)]
+        for d in entries:
+            white_db[d] = False
+        tld_seg = 2
+
+        def brute_white(name: str) -> bool:
+            if name in white_db:
+                return True
+            if name.startswith("www.") and name[4:] in white_db:
+                return True
+            parts = name.split(".")
+            # suffix walk: start from parts[1:] down
+            for i in range(1, len(parts)):
+                suffix = ".".join(parts[i:])
+                x = len(parts) - i  # remaining label count
+                if x >= tld_seg and white_db.get(suffix):
+                    return True
+            return False
+
+        for _ in range(self.N_QUERIES):
+            q = self._rand_domain(rng)
+            expected = brute_white(q)
+            result = whitelist_check_domain(q, white_db, tld_seg)
+            assert result == expected, f"whitelist_check_domain({q!r}) -> {result}, expected {expected}"
+
+    def test_evaluate_noaaaa_vs_brute_force(self):
+        rng = random.Random(self.SEED + 2)
+        noaaaa_db: dict = {}
+        entries = [self._rand_domain(rng) for _ in range(self.N_ENTRIES)]
+        for d in entries:
+            noaaaa_db[d] = rng.choice([True, False])
+
+        def brute_noaaaa(q: str) -> bool:
+            # Exact branch: presence check (is not None) — wildcard flag irrelevant
+            if noaaaa_db.get(q) is not None:
+                return True
+            # Wildcard-parent branch mirrors find_noaaaa_wildcard_parent exactly:
+            #   start from immediate parent; walk while parent still has a dot;
+            #   truthy check (wildcard=False is falsy → not matched);
+            #   stops before single-label (TLD) suffix.
+            parent = q.split(".", 1)[-1]
+            for _ in range(parent.count("."), 0, -1):
+                if noaaaa_db.get(parent):
+                    return True
+                parent = parent.split(".", 1)[-1]
+            return False
+
+        for _ in range(self.N_QUERIES):
+            q = self._rand_domain(rng)
+            expected = brute_noaaaa(q)
+            result = evaluate_noaaaa(q, noaaaa_db)
+            assert result == expected, f"evaluate_noaaaa({q!r}) -> {result}, expected {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Golden tests for evaluate_domain / evaluate_noaaaa orchestration
+# These are the contract the trie-backed implementation must reproduce.
+# ---------------------------------------------------------------------------
+
+
+def _make_cfg(**overrides):
+    """Return a minimal cfg dict with safe defaults; caller overrides as needed."""
+    base = {
+        "python_blocking": True,
+        "dataDB": False,
+        "zoneDB": False,
+        "python_tld": False,
+        "python_tlds": [],
+        "dnsbl_ipv4": "10.10.10.1",
+        "dnsbl_ipv6": "::1",
+        "python_idn": False,
+        "regexDB": False,
+        "whiteDB": False,
+        "python_tld_seg": 2,
+        "hstsDB": False,
+        "hsts_tlds": ("app", "dev"),
+    }
+    base.update(overrides)
+    return base
+
+
+def _make_containers(**overrides):
+    """Return a minimal containers dict; caller overrides as needed."""
+    base: dict = {
+        "dataDB": defaultdict(list),
+        "zoneDB": defaultdict(list),
+        "whiteDB": defaultdict(list),
+        "regexDB": defaultdict(str),
+        "feedGroupIndexDB": defaultdict(list),
+        "hstsDB": defaultdict(str),
+    }
+    base.update(overrides)
+    return base
+
+
+class TestEvaluateDomainGolden:
+    def test_data_hit(self):
+        data_db: dict = {"evil.com": {"log": "1", "index": 0}}
+        fgi_db: dict = {0: {"feed": "BadFeed", "group": "BadGroup"}}
+        containers = _make_containers(dataDB=data_db, feedGroupIndexDB=fgi_db)
+        cfg = _make_cfg(dataDB=True)
+        dec = evaluate_domain("evil.com", "evil.com", "com", False, cfg, containers)
+        assert dec.is_found is True
+        assert dec.in_whitelist is False
+        assert dec.b_type == "DNSBL"
+        assert dec.b_eval == "evil.com"
+        assert dec.feed == "BadFeed"
+        assert dec.group == "BadGroup"
+        assert dec.log_type == "1"
+        assert dec.null_blocking is False  # log_type="1" and not in_hsts -> null_blocking=False
+
+    def test_data_exact_does_not_match_subdomain(self):
+        data_db: dict = {"evil.com": {"log": "1", "index": 0}}
+        containers = _make_containers(dataDB=data_db)
+        cfg = _make_cfg(dataDB=True)
+        dec = evaluate_domain("sub.evil.com", "sub.evil.com", "com", False, cfg, containers)
+        assert dec.is_found is False
+
+    def test_zone_hit_wildcard_incl_self(self):
+        zone_db: dict = {"example.com": {"log": "1", "index": 0}}
+        fgi_db: dict = {0: {"feed": "ZoneFeed", "group": "ZoneGroup"}}
+        containers = _make_containers(zoneDB=zone_db, feedGroupIndexDB=fgi_db)
+        cfg = _make_cfg(zoneDB=True)
+        # Self match
+        dec_self = evaluate_domain("example.com", "example.com", "com", False, cfg, containers)
+        assert dec_self.is_found is True
+        assert dec_self.b_type == "TLD"
+        assert dec_self.b_eval == "example.com"
+        # Subdomain match
+        dec_sub = evaluate_domain("sub.example.com", "sub.example.com", "com", False, cfg, containers)
+        assert dec_sub.is_found is True
+        assert dec_sub.b_type == "TLD"
+        assert dec_sub.b_eval == "example.com"  # matched parent, not query name
+
+    def test_zone_b_eval_is_parent_not_query(self):
+        zone_db: dict = {"example.com": {"log": "1", "index": 0}}
+        containers = _make_containers(zoneDB=zone_db)
+        cfg = _make_cfg(zoneDB=True)
+        dec = evaluate_domain("deep.sub.example.com", "deep.sub.example.com", "com", False, cfg, containers)
+        assert dec.b_eval == "example.com"
+
+    def test_tld_allow(self):
+        cfg = _make_cfg(python_tld=True, python_tlds=["com", "net"])
+        containers = _make_containers()
+        # "com" NOT in allowed list → block
+        dec = evaluate_domain("example.org", "example.org", "example", False, cfg, containers)
+        assert dec.is_found is True
+        assert dec.feed == "TLD_Allow"
+        assert dec.group == "DNSBL_TLD_Allow"
+
+    def test_tld_allow_passthrough_when_tld_allowed(self):
+        cfg = _make_cfg(python_tld=True, python_tlds=["com"])
+        containers = _make_containers()
+        dec = evaluate_domain("example.com", "example.com", "com", False, cfg, containers)
+        assert dec.is_found is False
+
+    def test_idn_block(self):
+        cfg = _make_cfg(python_idn=True)
+        containers = _make_containers()
+        dec = evaluate_domain("xn--evil.com", "xn--evil.com", "com", False, cfg, containers)
+        assert dec.is_found is True
+        assert dec.feed == "IDN"
+        assert dec.group == "DNSBL_IDN"
+
+    def test_regex_block(self):
+        regex_db: dict = {"bad-pattern": re.compile(r"tracker")}
+        cfg = _make_cfg(regexDB=True)
+        containers = _make_containers(regexDB=regex_db)
+        dec = evaluate_domain("tracker.evil.com", "tracker.evil.com", "com", False, cfg, containers)
+        assert dec.is_found is True
+        assert dec.group == "DNSBL_Regex"
+        assert dec.feed == "bad-pattern"
+
+    def test_whitelist_override(self):
+        data_db: dict = {"evil.com": {"log": "1", "index": 0}}
+        white_db: dict = {"evil.com": False}
+        fgi_db: dict = {0: {"feed": "F", "group": "G"}}
+        containers = _make_containers(dataDB=data_db, whiteDB=white_db, feedGroupIndexDB=fgi_db)
+        cfg = _make_cfg(dataDB=True, whiteDB=True)
+        dec = evaluate_domain("evil.com", "evil.com", "com", False, cfg, containers)
+        assert dec.is_found is True
+        assert dec.in_whitelist is True
+        # Whitelisted → null_blocking stays True (default), b_type stays "DNSBL"
+        assert dec.null_blocking is True
+
+    def test_hsts_null_blocking(self):
+        data_db: dict = {"evil.com": {"log": "1", "index": 0}}
+        hsts_db: dict = {"evil.com": 0}
+        fgi_db: dict = {0: {"feed": "F", "group": "G"}}
+        containers = _make_containers(dataDB=data_db, hstsDB=hsts_db, feedGroupIndexDB=fgi_db)
+        cfg = _make_cfg(dataDB=True, hstsDB=True, hsts_tlds=())
+        dec = evaluate_domain("evil.com", "evil.com", "com", False, cfg, containers)
+        assert dec.is_found is True
+        assert dec.in_hsts is True
+        assert dec.p_type == "HSTS"
+        # in_hsts → null_blocking stays True even though log_type="1"
+        assert dec.null_blocking is True
+
+    def test_hsts_tld_null_blocking(self):
+        data_db: dict = {"evil.app": {"log": "1", "index": 0}}
+        fgi_db: dict = {0: {"feed": "F", "group": "G"}}
+        containers = _make_containers(dataDB=data_db, feedGroupIndexDB=fgi_db)
+        cfg = _make_cfg(dataDB=True, hstsDB=True, hsts_tlds=("app",))
+        dec = evaluate_domain("evil.app", "evil.app", "app", False, cfg, containers)
+        assert dec.in_hsts is True
+        assert dec.p_type == "HSTS_TLD"
+        assert dec.null_blocking is True
+
+    def test_cname_b_type_suffix(self):
+        data_db: dict = {"evil.com": {"log": "1", "index": 0}}
+        fgi_db: dict = {0: {"feed": "F", "group": "G"}}
+        containers = _make_containers(dataDB=data_db, feedGroupIndexDB=fgi_db)
+        cfg = _make_cfg(dataDB=True)
+        dec = evaluate_domain("evil.com", "original.com", "com", True, cfg, containers)
+        assert dec.is_found is True
+        assert dec.b_type == "DNSBL_CNAME"
+
+    def test_not_found_returns_default_decision(self):
+        containers = _make_containers()
+        cfg = _make_cfg()
+        dec = evaluate_domain("notblocked.com", "notblocked.com", "com", False, cfg, containers)
+        assert dec.is_found is False
+        assert dec.in_whitelist is False
+        assert dec.in_hsts is False
+        assert dec.feed == "Unknown"
+        assert dec.group == "Unknown"
+        assert dec.b_eval == ""
+        assert dec.b_type == "Python"
+        assert dec.p_type == "Python"
+        # null_blocking stays True when not found (no DNSBL response sent)
+        assert dec.null_blocking is True
+
+    def test_python_blocking_false_skips_data_zone(self):
+        data_db: dict = {"evil.com": {"log": "1", "index": 0}}
+        containers = _make_containers(dataDB=data_db)
+        cfg = _make_cfg(dataDB=True, python_blocking=False)
+        dec = evaluate_domain("evil.com", "evil.com", "com", False, cfg, containers)
+        assert dec.is_found is False
+
+    def test_log_type_2_does_not_change_null_blocking(self):
+        # log_type != "1" → null_blocking stays True (default)
+        data_db: dict = {"evil.com": {"log": "2", "index": 0}}
+        fgi_db: dict = {0: {"feed": "F", "group": "G"}}
+        containers = _make_containers(dataDB=data_db, feedGroupIndexDB=fgi_db)
+        cfg = _make_cfg(dataDB=True)
+        dec = evaluate_domain("evil.com", "evil.com", "com", False, cfg, containers)
+        assert dec.is_found is True
+        assert dec.null_blocking is True  # log_type="2" != "1" → no null_blocking flip
+
+
+class TestEvaluateNoaaaGolden:
+    def test_exact_match(self):
+        noaaaa_db: dict = {"example.com": False}
+        assert evaluate_noaaaa("example.com", noaaaa_db) is True
+
+    def test_exact_match_wildcard_true(self):
+        noaaaa_db: dict = {"example.com": True}
+        assert evaluate_noaaaa("example.com", noaaaa_db) is True
+
+    def test_wildcard_parent_matches_child(self):
+        noaaaa_db: dict = {"example.com": True}
+        assert evaluate_noaaaa("sub.example.com", noaaaa_db) is True
+
+    def test_wildcard_false_parent_does_not_match_child(self):
+        noaaaa_db: dict = {"example.com": False}
+        assert evaluate_noaaaa("sub.example.com", noaaaa_db) is False
+
+    def test_no_entry(self):
+        noaaaa_db: dict = {}
+        assert evaluate_noaaaa("example.com", noaaaa_db) is False
+
+    def test_parent_only_semantics_self_requires_exact_key(self):
+        # Wildcard on "example.com" does NOT match self via wildcard branch;
+        # exact branch handles self. Both give True but via different paths.
+        # Remove exact key; confirm subdomain still matches.
+        noaaaa_db: dict = {"example.com": True}
+        # "example.com" itself: exact branch fires → True
+        assert evaluate_noaaaa("example.com", noaaaa_db) is True
+        # "sub.example.com": wildcard-parent branch fires → True
+        assert evaluate_noaaaa("sub.example.com", noaaaa_db) is True
+        # A domain with only the sub key (wildcard) should NOT match deeper sub
+        noaaaa_db2: dict = {"sub.example.com": True}
+        # "deep.sub.example.com": parent chain includes "sub.example.com" → True
+        assert evaluate_noaaaa("deep.sub.example.com", noaaaa_db2) is True
