@@ -96,6 +96,7 @@ excludeDB: list[str]
 excludeAAAADB: list[str]
 excludeSS: list[str]
 maxmindReader: Any
+domainTrie: TrieNode
 
 # Background I/O worker (file + sqlite writes off the DNS response path)
 pfb_task_queue: queue.Queue
@@ -210,7 +211,8 @@ def init_standard(id: int, env: module_env) -> bool:
         feedGroupIndexDB, \
         maxmindReader, \
         pfb_task_queue, \
-        pfb_worker_thread
+        pfb_worker_thread, \
+        domainTrie
 
     if not register_inplace_cb_reply(inplace_cb_reply, env, id):
         log_info("[pfBlockerNG]: Failed register_inplace_cb_reply")
@@ -380,6 +382,10 @@ def init_standard(id: int, env: module_env) -> bool:
     excludeAAAADB = []
     excludeSS = []
 
+    # Trie rebuilt from scratch on each (re)load; populated in parallel with
+    # the dicts below. Readers remain on the dicts until Phase 6.
+    domainTrie = TrieNode()
+
     # Read pfb_unbound.ini settings
     if os.path.isfile(pfb["pfb_unbound.ini"]):
         config = ConfigParser()
@@ -485,6 +491,7 @@ def init_standard(id: int, env: module_env) -> bool:
                                 else:
                                     wildcard = False
                                 noAAAADB[data[0]] = wildcard
+                                trie_insert_noaaaa(domainTrie, data[0], wildcard)
                             else:
                                 sys.stderr.write(
                                     "[pfBlockerNG]: Failed to parse: noAAAA: row:{} line:{}".format(key, line)
@@ -549,6 +556,7 @@ def init_standard(id: int, env: module_env) -> bool:
                                     final_index = isInFeedGroupDB
 
                                 zoneDB[row[1]] = {"log": row[3], "index": final_index}
+                                trie_insert_zone(domainTrie, row[1], {"log": row[3], "index": final_index})
                             else:
                                 sys.stderr.write(
                                     "[pfBlockerNG]: Failed to parse: {}: {}".format(pfb["pfb_py_zone"], row)
@@ -582,6 +590,7 @@ def init_standard(id: int, env: module_env) -> bool:
                                     final_index = isInFeedGroupDB
 
                                 dataDB[row[1]] = {"log": row[3], "index": final_index}
+                                trie_insert_data(domainTrie, row[1], {"log": row[3], "index": final_index})
                             else:
                                 sys.stderr.write(
                                     "[pfBlockerNG]: Failed to parse: {}: {}".format(pfb["pfb_py_data"], row)
@@ -609,6 +618,7 @@ def init_standard(id: int, env: module_env) -> bool:
                                     else:
                                         wildcard = False
                                     whiteDB[row[0]] = wildcard
+                                    trie_insert_white(domainTrie, row[0], wildcard)
                                     pfb["whiteDB"] = True
                                 else:
                                     sys.stderr.write(
@@ -624,7 +634,9 @@ def init_standard(id: int, env: module_env) -> bool:
                     try:
                         with open(pfb["pfb_py_hsts"]) as hsts:
                             for line in hsts:
-                                hstsDB[line.rstrip("\r\n")] = 0
+                                domain = line.rstrip("\r\n")
+                                hstsDB[domain] = 0
+                                trie_insert_hsts(domainTrie, domain)
                             pfb["hstsDB"] = True
                     except Exception as e:
                         sys.stderr.write("[pfBlockerNG]: Failed to load: {}: {}".format(pfb["pfb_py_hsts"], e))

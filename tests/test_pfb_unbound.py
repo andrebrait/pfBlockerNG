@@ -1579,3 +1579,156 @@ class TestTrieEquivalence:
         trie_insert_hsts(root, "other.com")
         result = trie_lookup_hsts(root, "example.com", (), "com")
         assert result == (False, "Python")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Dual-populate consistency test
+# Verifies that domainTrie built via init_standard() dual-writes agrees with
+# the dicts for all loaded keys. Readers still use the dicts; this is a dev
+# correctness check only.
+# ---------------------------------------------------------------------------
+
+
+class TestDomainTrieConsistency:
+    """Populate module globals (dicts + domainTrie) in sync; assert agreement.
+
+    Mirrors what init_standard() does: each dict write is paired with a trie
+    insert. After loading, we check every inserted key against both structures.
+    """
+
+    HSTS_TLDS: tuple = ("app", "dev")
+    TLD_SEG: int = 2
+
+    def _load(self) -> None:
+        """Populate dicts and domainTrie with a fixed fixture corpus."""
+        root = pfb_unbound.domainTrie
+
+        # data entries
+        for domain, log, index in [
+            ("evil.com", "1", 0),
+            ("bad.net", "2", 1),
+            ("ads.example.org", "1", 2),
+        ]:
+            payload = {"log": log, "index": index}
+            pfb_unbound.dataDB[domain] = payload
+            trie_insert_data(root, domain, payload)
+            pfb_unbound.feedGroupIndexDB[index] = {"feed": f"Feed{index}", "group": f"Group{index}"}
+
+        # zone entries (wildcard-incl-self)
+        for domain, log, index in [
+            ("blocked.io", "1", 10),
+            ("zone.com", "2", 11),
+        ]:
+            payload = {"log": log, "index": index}
+            pfb_unbound.zoneDB[domain] = payload
+            trie_insert_zone(root, domain, payload)
+            pfb_unbound.feedGroupIndexDB[index] = {"feed": f"Feed{index}", "group": f"Group{index}"}
+
+        # whitelist entries
+        for domain, wildcard in [
+            ("allowed.com", False),
+            ("safe.net", True),
+        ]:
+            pfb_unbound.whiteDB[domain] = wildcard
+            trie_insert_white(root, domain, wildcard)
+
+        # hsts entries
+        for domain in ["secure.example.com", "hsts.org"]:
+            pfb_unbound.hstsDB[domain] = 0
+            trie_insert_hsts(root, domain)
+
+        # noAAAA entries
+        for domain, wildcard in [
+            ("noaaaa.com", False),
+            ("wildcard-noaaaa.net", True),
+        ]:
+            pfb_unbound.noAAAADB[domain] = wildcard
+            trie_insert_noaaaa(root, domain, wildcard)
+
+    def test_data_trie_matches_dict(self) -> None:
+        """trie_lookup_exact agrees with dataDB for all loaded data keys."""
+        self._load()
+        root = pfb_unbound.domainTrie
+        for domain in pfb_unbound.dataDB:
+            if domain == "last-event":
+                continue
+            expected = pfb_unbound.dataDB.get(domain)
+            got = trie_lookup_exact(root, domain)
+            assert got == expected, f"data mismatch for {domain!r}"
+
+    def test_data_trie_no_false_positives(self) -> None:
+        """Domains not in dataDB are not found by trie_lookup_exact."""
+        self._load()
+        root = pfb_unbound.domainTrie
+        for q in ("notloaded.com", "sub.evil.com", "other.org"):
+            assert pfb_unbound.dataDB.get(q) is None
+            assert trie_lookup_exact(root, q) is None, f"unexpected exact hit for {q!r}"
+
+    def test_zone_trie_matches_dict(self) -> None:
+        """trie_lookup_zone agrees with find_zone_match for all zone keys and their subdomains."""
+        self._load()
+        root = pfb_unbound.domainTrie
+        for domain in list(pfb_unbound.zoneDB.keys()):
+            # self match
+            expected_key, expected_payload = find_zone_match(domain, pfb_unbound.zoneDB)
+            got_key, got_payload = trie_lookup_zone(root, domain)
+            assert got_key == expected_key, f"zone self-match key mismatch for {domain!r}"
+            assert got_payload == expected_payload, f"zone self-match payload mismatch for {domain!r}"
+            # subdomain match
+            sub = "sub." + domain
+            expected_key2, expected_payload2 = find_zone_match(sub, pfb_unbound.zoneDB)
+            got_key2, got_payload2 = trie_lookup_zone(root, sub)
+            assert got_key2 == expected_key2, f"zone subdomain-match key mismatch for {sub!r}"
+            assert got_payload2 == expected_payload2
+
+    def test_zone_trie_no_false_positives(self) -> None:
+        self._load()
+        root = pfb_unbound.domainTrie
+        for q in ("unblocked.com", "good.io"):
+            matched_d, _ = find_zone_match(q, pfb_unbound.zoneDB)
+            got_key, _ = trie_lookup_zone(root, q)
+            assert got_key == matched_d, f"zone false positive for {q!r}"
+
+    def test_white_trie_matches_dict(self) -> None:
+        """trie_lookup_white agrees with whitelist_check_domain for all whitelist keys."""
+        self._load()
+        root = pfb_unbound.domainTrie
+        queries = list(pfb_unbound.whiteDB.keys()) + [
+            "sub.allowed.com",
+            "www.allowed.com",
+            "sub.safe.net",
+            "notwhitelisted.com",
+        ]
+        for q in queries:
+            expected = whitelist_check_domain(q, pfb_unbound.whiteDB, self.TLD_SEG)
+            got = trie_lookup_white(root, q, self.TLD_SEG)
+            assert got == expected, f"white mismatch for {q!r}"
+
+    def test_hsts_trie_matches_dict(self) -> None:
+        """trie_lookup_hsts agrees with hsts_check_domain for all hsts keys."""
+        self._load()
+        root = pfb_unbound.domainTrie
+        queries = list(pfb_unbound.hstsDB.keys()) + [
+            "sub.secure.example.com",
+            "example.app",
+            "notinhsts.com",
+        ]
+        for q in queries:
+            tld = q.rsplit(".", 1)[-1]
+            expected = hsts_check_domain(q, pfb_unbound.hstsDB, self.HSTS_TLDS, tld)
+            got = trie_lookup_hsts(root, q, self.HSTS_TLDS, tld)
+            assert got == expected, f"hsts mismatch for {q!r}"
+
+    def test_noaaaa_trie_matches_dict(self) -> None:
+        """trie_lookup_noaaaa agrees with evaluate_noaaaa for all noAAAA keys."""
+        self._load()
+        root = pfb_unbound.domainTrie
+        queries = list(pfb_unbound.noAAAADB.keys()) + [
+            "sub.noaaaa.com",
+            "sub.wildcard-noaaaa.net",
+            "notinnoaaaa.com",
+        ]
+        for q in queries:
+            expected = evaluate_noaaaa(q, pfb_unbound.noAAAADB)
+            got = trie_lookup_noaaaa(root, q)
+            assert got == expected, f"noaaaa mismatch for {q!r}"

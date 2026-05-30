@@ -97,3 +97,4 @@ def reset_pfb_globals():
     pfb_unbound.excludeAAAADB = []
     pfb_unbound.excludeSS = []
     pfb_unbound.threads = []
+    pfb_unbound.domainTrie = pfb_unbound.TrieNode()
