@@ -29,7 +29,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     # Symbols injected by Unbound's embedded Python interpreter (pythonmod) into
@@ -1515,30 +1515,35 @@ def _trie_walk(root: TrieNode, labels: list[str]) -> TrieNode | None:
     return node
 
 
-def trie_insert_data(root: TrieNode, domain: str, payload: dict[str, Any]) -> None:
-    """Insert exact-match payload into trie (mirrors dataDB semantics)."""
+def _trie_get_terminal(root: TrieNode, domain: str) -> TrieNode | None:
+    """Return (creating nodes as needed) the terminal node for domain; None if domain is empty."""
     labels = trie_split_labels(domain)
     if not labels:
+        return None
+    return _trie_walk_or_create(root, labels)
+
+
+def trie_insert_data(root: TrieNode, domain: str, payload: dict[str, Any]) -> None:
+    """Insert exact-match payload into trie (mirrors dataDB semantics)."""
+    node = _trie_get_terminal(root, domain)
+    if node is None:
         return
-    node = _trie_walk_or_create(root, labels)
     node.data = payload
 
 
 def trie_insert_zone(root: TrieNode, domain: str, payload: dict[str, Any]) -> None:
     """Insert wildcard-incl-self zone payload (mirrors zoneDB semantics)."""
-    labels = trie_split_labels(domain)
-    if not labels:
+    node = _trie_get_terminal(root, domain)
+    if node is None:
         return
-    node = _trie_walk_or_create(root, labels)
     node.zone = payload
 
 
 def trie_insert_white(root: TrieNode, domain: str, wildcard: bool) -> None:
     """Insert whitelist entry (exact or wildcard-suffix) into trie."""
-    labels = trie_split_labels(domain)
-    if not labels:
+    node = _trie_get_terminal(root, domain)
+    if node is None:
         return
-    node = _trie_walk_or_create(root, labels)
     if wildcard:
         node.white_wild = True
     else:
@@ -1547,10 +1552,9 @@ def trie_insert_white(root: TrieNode, domain: str, wildcard: bool) -> None:
 
 def trie_insert_noaaaa(root: TrieNode, domain: str, wildcard: bool) -> None:
     """Insert noAAAA entry (exact presence or wildcard-parent) into trie."""
-    labels = trie_split_labels(domain)
-    if not labels:
+    node = _trie_get_terminal(root, domain)
+    if node is None:
         return
-    node = _trie_walk_or_create(root, labels)
     # noaaaa uses presence check (is not None) for exact; truthy for wildcard-parent.
     # Store the bool value so both checks work correctly.
     node.noaaaa = wildcard
@@ -1560,10 +1564,9 @@ def trie_insert_noaaaa(root: TrieNode, domain: str, wildcard: bool) -> None:
 
 def trie_insert_hsts(root: TrieNode, domain: str) -> None:
     """Insert HSTS domain into trie."""
-    labels = trie_split_labels(domain)
-    if not labels:
+    node = _trie_get_terminal(root, domain)
+    if node is None:
         return
-    node = _trie_walk_or_create(root, labels)
     node.hsts = True
 
 
@@ -1590,11 +1593,10 @@ def trie_lookup_zone(root: TrieNode, name: str) -> tuple[str, dict[str, Any]] | 
         return None, None
 
     node = root
-    best_key: str | None = None
-    best_payload: dict[str, Any] | None = None
-    # Accumulate labels (in forward/human-readable order) as we descend.
-    # labels[0] is TLD, labels[-1] is leftmost label.
-    # After descending i+1 labels we have matched labels[i..0] reversed = labels[0..i].
+    # Track the best zone hit as (depth, payload); reconstructed once after the loop.
+    best: tuple[int, dict[str, Any]] | None = None
+    # Accumulate labels (TLD-first) as we descend; used once at the end to
+    # reconstruct the matched domain string (reversed slice up to best depth).
     accumulated: list[str] = []
 
     for label in labels:
@@ -1608,65 +1610,65 @@ def trie_lookup_zone(root: TrieNode, name: str) -> tuple[str, dict[str, Any]] | 
         node = child
         accumulated.append(label)
         if node.zone is not None:
-            # Reconstruct human-readable domain from accumulated labels (reverse of TLD-first).
-            best_key = ".".join(reversed(accumulated))
-            best_payload = node.zone
+            best = (len(accumulated), node.zone)
 
-    if best_key is None:
+    if best is None:
         return None, None
-    return best_key, best_payload
+    depth, payload = best
+    return ".".join(reversed(accumulated[:depth])), payload
 
 
 def trie_lookup_white(root: TrieNode, name: str, tld_seg: int) -> bool:
     """Reproduce whitelist_check_domain() semantics via trie.
 
-    Three branches:
-    1. Exact match (.white on terminal node for name).
-    2. 'www.'-strip: exact match (.white) on name[4:] after stripping 'www.' prefix.
-    3. Suffix walk: walk progressively shorter suffixes of name; match .white or
-       .white_wild on the suffix node only when suffix label-count x >= tld_seg.
+    Single descent collects path_nodes; all three branches then use them:
+    1. Exact match: terminal node has .white or .white_wild (presence check).
+    2. 'www.'-strip: terminal of name[4:] has .white or .white_wild.
+    3. Suffix walk: from depth (full_depth-1) down to tld_seg, check .white_wild
+       (truthy — mirrors the dict's truthy check that skips wildcard=False entries).
     """
-    # Branch 1: exact match (presence check — mirrors white_db.get(name) is not None).
-    # Both exact (white) and wildcard (white_wild) entries count as present.
     labels = trie_split_labels(name)
-    if labels:
-        node = _trie_walk(root, labels)
-        if node is not None and (node.white or node.white_wild):
-            return True
+    if not labels:
+        return False
 
-    # Branch 2: www.-strip exact (presence check on stripped name).
+    # Single descent — collect all nodes along the path (depth 1 = TLD at index 0).
+    path_nodes: list[TrieNode] = []
+    node = root
+    for label in labels:
+        if not label:
+            continue
+        if node.children is None:
+            break
+        child = node.children.get(label)
+        if child is None:
+            break
+        node = child
+        path_nodes.append(node)
+
+    n = len(path_nodes)
+    full_depth = len([lb for lb in labels if lb])
+
+    # Branch 1: exact match on full name (presence — both .white and .white_wild count).
+    if n == full_depth and (path_nodes[-1].white or path_nodes[-1].white_wild):
+        return True
+
+    # Branch 2: www.-strip exact match (presence check on stripped name).
+    # The stripped name's terminal is path_nodes[stripped_depth-1] since it is a
+    # proper suffix and therefore lies on the same descent path.
     if name.startswith("www."):
-        stripped = name[4:]
-        slabels = trie_split_labels(stripped)
-        if slabels:
-            snode = _trie_walk(root, slabels)
-            if snode is not None and (snode.white or snode.white_wild):
+        stripped_depth = full_depth - 1  # drop the "www" label
+        if stripped_depth > 0 and stripped_depth <= n:
+            snode = path_nodes[stripped_depth - 1]
+            if snode.white or snode.white_wild:
                 return True
 
-    # Branch 3: suffix walk (mirrors whitelist_check_domain suffix loop).
-    # whitelist_check_domain does:
-    #   q = name.split(".", 1)[-1]          # drop leftmost label
-    #   for x in range(q.count(".")+1, 0, -1):
-    #       if x >= tld_seg and white_db.get(q): return True  # truthy check
-    #       q = q.split(".", 1)[-1]
-    # white_db.get(q) is truthy: True matches, False does not.
-    # In the trie: .white_wild stores True entries (wildcard=True, truthy).
-    # .white stores False entries (wildcard=False, falsy) — suffix walk skips these.
-    if "." not in name:
-        return False
-    suffix = name.split(".", 1)[1]  # drop leftmost label of name
-    # x starts at suffix.count(".")+1 = number of labels in suffix
-    q = suffix
-    x = q.count(".") + 1
-    while x > 0:
-        if x >= tld_seg:
-            qlabels = trie_split_labels(q)
-            if qlabels:
-                qnode = _trie_walk(root, qlabels)
-                if qnode is not None and qnode.white_wild:
-                    return True
-        q = q.split(".", 1)[-1]
-        x -= 1
+    # Branch 3: suffix walk gated by tld_seg (truthy — only .white_wild matches,
+    # mirroring the dict's truthy check that skips wildcard=False entries).
+    # The walk drops the leftmost label of name (depth full_depth-1) and continues
+    # down to depth tld_seg.  In path_nodes: depth d = index d-1.
+    for d in range(full_depth - 1, tld_seg - 1, -1):
+        if d <= n and path_nodes[d - 1].white_wild:
+            return True
 
     return False
 
@@ -1674,32 +1676,42 @@ def trie_lookup_white(root: TrieNode, name: str, tld_seg: int) -> bool:
 def trie_lookup_noaaaa(root: TrieNode, name: str) -> bool:
     """Reproduce evaluate_noaaaa() via trie.
 
+    Single descent collects path_nodes; both branches use them:
     - Exact: terminal node .noaaaa is not None (presence, any value).
-    - Wildcard-parent: walk parent suffixes (NOT self); match if .noaaaa_wild is truthy.
-      Stop before single-label suffix (TLD only — depth 1).
+    - Wildcard-parent: walk ancestors from direct parent (depth full_depth-1) down
+      to depth 2; match if .noaaaa_wild is truthy.  Stops before depth 1 (TLD).
     """
-    # Exact branch (mirrors noaaaa_db.get(q_name) is not None)
     labels = trie_split_labels(name)
-    if labels:
-        node = _trie_walk(root, labels)
-        if node is not None and node.noaaaa is not None:
-            return True
-
-    # Wildcard-parent branch (mirrors find_noaaaa_wildcard_parent).
-    # Start from direct parent (drop leftmost label), stop before single-label suffix.
-    if "." not in name:
+    if not labels:
         return False
-    q = name.split(".", 1)[1]  # direct parent
-    # Loop mirrors: for _ in range(q.count("."), 0, -1)
-    # q.count(".") gives number of dots; stops before 0 (single-label TLD).
-    depth = q.count(".")
-    for _ in range(depth, 0, -1):
-        qlabels = trie_split_labels(q)
-        if qlabels:
-            qnode = _trie_walk(root, qlabels)
-            if qnode is not None and qnode.noaaaa_wild:
-                return True
-        q = q.split(".", 1)[1]
+
+    # Single descent — collect all nodes along the path (depth 1 = TLD at index 0).
+    path_nodes: list[TrieNode] = []
+    node = root
+    for label in labels:
+        if not label:
+            continue
+        if node.children is None:
+            break
+        child = node.children.get(label)
+        if child is None:
+            break
+        node = child
+        path_nodes.append(node)
+
+    n = len(path_nodes)
+    full_depth = len([lb for lb in labels if lb])
+
+    # Exact branch: terminal node's .noaaaa is not None (presence check).
+    if n == full_depth and path_nodes[-1].noaaaa is not None:
+        return True
+
+    # Wildcard-parent branch (mirrors find_noaaaa_wildcard_parent):
+    # check depths full_depth-1, full_depth-2, ..., 2 (stop before TLD at depth 1).
+    # In path_nodes: depth d = index d-1.
+    for d in range(full_depth - 1, 1, -1):
+        if d <= n and path_nodes[d - 1].noaaaa_wild:
+            return True
 
     return False
 
@@ -1736,7 +1748,6 @@ def trie_lookup_hsts(
     # Collect path nodes (indexed 0 = TLD depth 1, last = deepest reached).
     path_nodes: list[TrieNode] = []
     node = root
-    accumulated: list[str] = []
     for label in labels:
         if not label:
             continue
@@ -1746,7 +1757,6 @@ def trie_lookup_hsts(
         if child is None:
             break
         node = child
-        accumulated.append(label)
         path_nodes.append(node)
 
     dot_count = name.count(".")
@@ -1773,11 +1783,11 @@ class DnsblDecision:
     in_whitelist: bool
     in_hsts: bool
     null_blocking: bool
-    log_type: Any
+    log_type: str | Literal[False]
     b_type: str
     p_type: str
-    feed: Any
-    group: Any
+    feed: str
+    group: str
     b_eval: str
 
 
@@ -1790,14 +1800,14 @@ def evaluate_domain(
     containers: dict[str, Any],
 ) -> DnsblDecision:
     is_found = False
-    log_type: Any = False
+    log_type: str | Literal[False] = False
     in_whitelist = False
     in_hsts = False
     null_blocking = True
     b_type = "Python"
     p_type = "Python"
-    feed: Any = "Unknown"
-    group: Any = "Unknown"
+    feed: str = "Unknown"
+    group: str = "Unknown"
     b_eval = ""
 
     data_db: dict[str, Any] = containers["dataDB"]
