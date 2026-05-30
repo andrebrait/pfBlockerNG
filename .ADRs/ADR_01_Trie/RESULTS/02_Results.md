@@ -59,13 +59,44 @@ def evaluate_domain(
 | `feedGroupIndexDB` | `feedGroupIndexDB` |
 | `hstsDB` | `hstsDB` |
 
-Note: `regexDB` matching is performed inline in `evaluate_domain` (iterating over
-`regex_db.items()`) rather than calling `pfb_regex_match()` which reads the global.
+Notes on evaluate_domain internals:
 
-`resolve_feed_group` was updated to accept `feed_group_index_db` as a second
-parameter (instead of reading the module global), making it pure and callable from
-`evaluate_domain`. Signature is now `resolve_feed_group(index, feed_group_index_db)`
-and it is called for both the data and zone hit branches inside `evaluate_domain`.
+- **`resolve_feed_group`** was updated (post-Phase-2 correction) to accept
+  `feed_group_index_db` as a second parameter rather than reading the module
+  global. It is called for both the data and zone hit branches.
+  Final signature: `resolve_feed_group(index, feed_group_index_db) -> tuple[Any, Any]`
+  (pure; no global reads).
+
+- **`regexDB` matching** is performed inline (`for k, r in regex_db.items()`)
+  rather than calling `pfb_regex_match()`, which still reads the module global
+  and is therefore not callable from a pure function.
+
+## resolve_feed_group signature (updated in Phase 2)
+
+```python
+def resolve_feed_group(index: Any, feed_group_index_db: dict[int, Any]) -> tuple[Any, Any]
+```
+
+Pure. Returns `(feed, group)` on hit, `("Unknown", "Unknown")` on miss.
+Called by `evaluate_domain` for data and zone hits.
+
+## Pure vs global-reading helpers (for Phase 3 test authoring)
+
+| Helper | Pure? | Notes |
+|--------|-------|-------|
+| `iter_domain_suffixes` | yes | |
+| `find_zone_match` | yes | takes `zone_db` arg |
+| `find_noaaaa_wildcard_parent` | yes | takes `noaaaa_db` arg |
+| `whitelist_check_domain` | yes | takes `white_db`, `tld_seg` args |
+| `hsts_check_domain` | yes | takes `hsts_db`, `hsts_tlds`, `tld` args |
+| `resolve_feed_group` | yes | takes `feed_group_index_db` arg |
+| `evaluate_domain` | yes | all inputs via `cfg` / `containers` |
+| `evaluate_noaaaa` | yes | takes `noaaaa_db` arg |
+| `pfb_regex_match` | **no** | reads global `regexDB` |
+
+Phase 3 oracle tests for pure helpers can pass containers directly without
+setting up module globals. Tests for `pfb_regex_match` must assign
+`pfb_unbound.regexDB` (as the existing tests already do).
 
 ## evaluate_noaaaa signature
 
